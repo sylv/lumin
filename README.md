@@ -18,6 +18,8 @@ lumin is a debrid proxy that handles streaming files from debrid services like T
 ## setup
 
 yeah wouldnt you like to know huh
+if you can figure it out, `hub.docker.com/r/sylver/lumin` has a prebuilt image.
+
 ᶦˡˡ ᵈᵒ ᵗʰᶦˢ ˡᵃᵗᵉʳ
 
 ## notes
