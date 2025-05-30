@@ -1,0 +1,1 @@
+ALTER TABLE torrents DROP COLUMN save_dir;
