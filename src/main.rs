@@ -17,10 +17,10 @@ use std::{
     env,
     str::FromStr,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, signal, sync::Notify, task::JoinHandle};
-use tracing::{debug, info};
+use tokio::{net::TcpListener, signal, sync::Notify, task::JoinHandle, time::sleep};
+use tracing::{debug, error, info, warn};
 
 mod cache;
 mod config;
@@ -39,6 +39,68 @@ pub struct AppState {
     pub debrid: Arc<Debrid>,
     pub notifier: Arc<Notify>,
     pub is_scanning: Arc<AtomicBool>,
+}
+
+/// Generic retry wrapper for background tasks
+/// Retries failed tasks up to 3 times with 5-minute delays
+/// Resets attempt counter if task runs for more than 60 seconds
+/// Kills the program if all retries are exhausted
+async fn run_with_retry<F, Fut>(task_name: &str, task_factory: F) -> Result<(), String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: Duration = Duration::from_secs(300);
+    const RESET_THRESHOLD: Duration = Duration::from_secs(60);
+
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+        let start_time = Instant::now();
+
+        info!("Starting {} (attempt {})", task_name, attempts);
+
+        match task_factory().await {
+            Ok(_) => {
+                info!("{} completed successfully", task_name);
+                return Ok(());
+            }
+            Err(e) => {
+                let runtime = start_time.elapsed();
+
+                if runtime >= RESET_THRESHOLD {
+                    // Task ran for more than 60 seconds before failing, reset attempts
+                    warn!(
+                        "{} failed after running for {:?}, resetting attempt counter: {}",
+                        task_name, runtime, e
+                    );
+                    attempts = 1; // Reset to 1 since we'll increment at start of next loop
+                } else {
+                    warn!("{} failed after {:?}: {}", task_name, runtime, e);
+                }
+
+                if attempts >= MAX_ATTEMPTS {
+                    error!(
+                        "{} failed {} times consecutively, killing program",
+                        task_name, MAX_ATTEMPTS
+                    );
+                    std::process::exit(1);
+                }
+
+                warn!(
+                    "{} will retry in {} seconds (attempt {} of {})",
+                    task_name,
+                    RETRY_DELAY.as_secs(),
+                    attempts + 1,
+                    MAX_ATTEMPTS
+                );
+
+                sleep(RETRY_DELAY).await;
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -89,9 +151,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let is_scanning = is_scanning.clone();
 
         async move {
-            start_reconciler(&db, debrid, notifier, is_scanning)
-                .await
-                .expect("Failed to start reconciler");
+            run_with_retry("reconciler", || {
+                let db = db.clone();
+                let debrid = debrid.clone();
+                let notifier = notifier.clone();
+                let is_scanning = is_scanning.clone();
+
+                async move {
+                    start_reconciler(&db, debrid, notifier, is_scanning)
+                        .await
+                        .map_err(|e| format!("Reconciler error: {}", e))
+                }
+            })
+            .await
+            .expect("Reconciler retry wrapper failed");
         }
     });
 
@@ -105,10 +178,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cache_handle = tokio::spawn({
             let cache = cache.clone();
             async move {
-                cache
-                    .start_sweeper()
-                    .await
-                    .expect("Failed to start cache sweeper")
+                run_with_retry("cache_sweeper", || {
+                    let cache = cache.clone();
+                    async move {
+                        cache
+                            .start_sweeper()
+                            .await
+                            .map_err(|e| format!("Cache sweeper error: {}", e))
+                    }
+                })
+                .await
+                .expect("Cache sweeper retry wrapper failed");
             }
         });
 
@@ -149,9 +229,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let cache = cache.clone();
 
         tokio::spawn(async move {
-            start_duration_extractor(db, cache)
-                .await
-                .expect("Failed to start duration extractor");
+            run_with_retry("duration_extractor", || {
+                let db = db.clone();
+                let cache = cache.clone();
+                async move {
+                    start_duration_extractor(db, cache)
+                        .await
+                        .map_err(|e| format!("Duration extractor error: {}", e))
+                }
+            })
+            .await
+            .expect("Duration extractor retry wrapper failed");
         })
     };
 
