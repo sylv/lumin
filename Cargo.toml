@@ -24,12 +24,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     # "gzip",
     # "deflate",
-    "brotli",
     # "zstd",
-    # "http2",
+    "brotli",
+    "http2",
     # "http3",
     "rustls-tls-native-roots",
-    # "multipart",
 ] }
 tokio = { version = "1.44", features = ["full"] }
 urlencoding = "2.1"
