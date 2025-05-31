@@ -13,6 +13,7 @@ use sea_orm::DatabaseConnection;
 use sqlx::sqlite::{
     SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
+use std::path::PathBuf;
 use std::{
     env,
     str::FromStr,
@@ -99,6 +100,43 @@ where
 
                 sleep(RETRY_DELAY).await;
             }
+        }
+    }
+}
+
+async fn try_unmount(mount_path: &PathBuf) {
+    let config = get_config();
+    if !config.ensure_unmounted {
+        return;
+    }
+
+    let mount_path_str = mount_path.to_string_lossy();
+    let result = tokio::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&*mount_path_str)
+        .output()
+        .await;
+
+    match result {
+        Ok(output) if output.status.success() => {
+            info!("Successfully unmounted {}", mount_path_str);
+            return;
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("not mounted") {
+                // If fusermount says it's not mounted, we can ignore this
+                info!("{} is not mounted", mount_path_str);
+                return;
+            }
+
+            warn!(
+                "Failed to unmount {}, this may cause issues: {}",
+                mount_path_str, stderr
+            );
+        }
+        Err(e) => {
+            warn!("Failed to execute fusermount3: {}", e);
         }
     }
 }
@@ -198,6 +236,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mount_handle = {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+
+        // todo: this might not be "proper", but if the process panics or in some other niche scenarios,
+        // the mount can be left intact and on restart it will fail to mount.
+        // this tries to avoid that by attempting to unmount the mount path before mounting again.
+        // this will probably fail in a lot of scenarios and may do bad things, but it will fix infinite boot loops
+        // under docker when the process shits its pants and restarts.
+        try_unmount(&config.mount_path).await;
 
         let mut mount_options = MountOptions::default();
         mount_options

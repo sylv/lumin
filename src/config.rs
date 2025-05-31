@@ -9,6 +9,7 @@ pub struct Config {
     pub mount_path: PathBuf,
     pub allow_other: bool,
     pub mount_unprivileged: bool,
+    pub ensure_unmounted: bool,
     pub torbox_key: String,
     pub torbox_username: Option<String>,
     pub torbox_password: Option<String>,
@@ -36,6 +37,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         .add_source(config::Environment::with_prefix("lumin"))
         .set_default("allow_other", false)?
         .set_default("mount_unprivileged", true)?
+        .set_default("ensure_unmounted", true)?
         .set_default("cache_target_size", cache_target_size)?
         .set_default("cache_max_size", cache_max_size)?
         .set_default("delete_unused", false)?
