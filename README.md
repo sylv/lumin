@@ -85,6 +85,7 @@ at this point you'll want to open sonarr and manually search for something. it s
 
 - running fuse under docker can be tricky, `/mnt:/mnt:rshared` seems to avoid most of the downfalls but prepare yourself for that.
 - the cache uses sparse files which will usually show as the full file size, even if the physical size is much smaller.
+- specifying `LUMIN_TORBOX_PASSWORD` and `LUMIN_TORBOX_USERNAME` can slightly increase performance if you have high ping to torbox, but webdav can cause issues and is less reliable than the CDN directly. 
 
 ## todo
 

@@ -114,6 +114,11 @@ async fn modify_torznab_response(state: Arc<AppState>, xml_body: &str) -> anyhow
         }
     }
 
+    if hashes.is_empty() {
+        tracing::info!("No infohashes found in the response, returning original XML");
+        return Ok(xml_body.to_string());
+    }
+
     let mut cache_states = state.debrid.check_cached(&hashes).await?;
     tracing::info!("Adding cache states to {} items", cache_states.0.len());
 
