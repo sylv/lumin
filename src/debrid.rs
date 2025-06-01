@@ -54,6 +54,16 @@ pub struct TorboxTorrentFile {
     pub size: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TorboxInstantAvailability(pub HashMap<String, TorboxInstantAvailabilityData>);
+
+#[derive(Debug, Deserialize)]
+pub struct TorboxInstantAvailabilityData {
+    pub name: String,
+    pub size: u64,
+    pub hash: String,
+}
+
 // todo: this is kinda bad, should be handled by lru for higher hit rates,
 // but for now its fine w/e.
 pub struct ExpiringItem<T> {
@@ -177,6 +187,32 @@ impl Debrid {
             .await?;
 
         match self.parse_response::<Vec<TorboxListTorrent>>(response)? {
+            TorboxResponse::Result { data, .. } => Ok(data),
+            TorboxResponse::Error { detail, .. } => Err(anyhow::anyhow!(detail)),
+        }
+    }
+
+    pub async fn check_cached(&self, hashes: &[String]) -> Result<TorboxInstantAvailability> {
+        let hash_batches = hashes
+            .chunks(100)
+            .map(|chunk| chunk.join(","))
+            .collect::<Vec<_>>()
+            .join("&hash=");
+
+        let url = format!(
+            "{}/torrents/checkcached?format=object&hash={}",
+            BASE_URL, hash_batches
+        );
+
+        self.wait().await;
+        let response = self
+            .add_headers(self.client.get(&url), true)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        match self.parse_response::<TorboxInstantAvailability>(response)? {
             TorboxResponse::Result { data, .. } => Ok(data),
             TorboxResponse::Error { detail, .. } => Err(anyhow::anyhow!(detail)),
         }

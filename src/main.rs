@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{net::TcpListener, signal, sync::Notify, task::JoinHandle, time::sleep};
+use torznab::proxy_torznab;
 use tracing::{debug, error, info, warn};
 
 mod cache;
@@ -34,6 +35,7 @@ mod helpers;
 mod qbittorrent;
 mod reconciler;
 mod rpc;
+mod torznab;
 
 pub struct AppState {
     pub db: DatabaseConnection,
@@ -297,6 +299,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[allow(unused_mut)]
     let mut app = Router::new()
+        .merge(proxy_torznab().with_state(state.clone()))
         .merge(mimic_qbittorrent().with_state(state.clone()))
         .nest("/trpc", get_rpc_router().with_state(state));
 

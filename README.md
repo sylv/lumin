@@ -14,15 +14,12 @@ lumin is a debrid proxy that handles streaming files from debrid services like T
 - (Very early) Web UI to manage torrents
 - Some other stuff I'm probably forgetting
 - It works with sonarr at least
+- Torznab proxy to inject cached states into responses
 - [TorBox](https://torbox.app) support too
 
-## setup
+## usage
 
-yeah wouldnt you like to know huh
-
-ᶦˡˡ ᵈᵒ ᵗʰᶦˢ ˡᵃᵗᵉʳ
-
-heres a rough example that **does not include auth**
+this section is rough while i figure things out
 
 ```yml
 services:
@@ -58,17 +55,41 @@ services:
       - LUMIN_TORBOX_PASSWORD=${TORBOX_PASSWORD}
 ```
 
+### connecting to sonarr
+
+1. Go to `Settings > Download Clients`
+2. Click the plus button
+3. Click `qBittorrent`
+4. Change the port to match lumin (8000 by default) and the host
+5. Change the "Category" to "sonarr" or "radarr" exactly
+   1. If you get an error similar to "Failed to authenticate with qBittorrent" its likely because the category does not match the labels configured in lumin. If sonarr can't create the label it fails with an auth error.
+6. Click "Test" then "Save"
+
+### proxying torznab
+
+> [!WARNING]
+> This is *only* necessary if you want to prioritize cached content in sonarr or radarr.
+
+if you want to prioritise cached content in sonarr or radarr, you need to proxy the torznab requests to prowlarr or jackett so it can inject cached states into the responses.
+
+1. In Prowlarr, go to `Settings -> Apps`
+2. Click the app you want to be proxied through Lumin and copy the "Prowlarr Server" URL
+3. URL encode the "Prowlarr Server" URL using [an online tool like this](https://www.urlencoder.org/)
+4. Replace the "Prowlarr Server" URL with `LUMIN_URL/torznab/<value>`, for example `http://lumin:8000/torznab/http%3A%2F%2Fprowlarr%3A9696`
+5. Click "Test" then "Save" 
+6. Click "Sync App Indexers"
+
+at this point you'll want to open sonarr and manually search for something. it should work and should show some results with `[CACHED]` at the start of the name, indicating they are cached. you can use that to change how you rank torrents, if you want to prefer cached content.
+
 ### notes
 
-- add as a "qBittorrent" download client in sonarr on port 8000
-  - labels must be used by sonarr/radarr or else there can be issues with download management
-  - if the labels in sonarr/radarr do not match the labels configured in lumin, you will get an error trying to add it as a download client because the label creation will fail.
 - running fuse under docker can be tricky, `/mnt:/mnt:rshared` seems to avoid most of the downfalls but prepare yourself for that.
 - the cache uses sparse files which will usually show as the full file size, even if the physical size is much smaller.
 
 ## todo
 
 - Usenet support
+- Remove blocked torrents from torznab responses
 - If torrents are downloading, increase the reconciler interval
 - Button to delete unused debrid torrents
 - Instead of blocking torrents, mark as errored and add error message with reason
