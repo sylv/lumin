@@ -8,7 +8,8 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use edit_xml::{Document, Element};
+use regex::Regex;
+use roxmltree::Document;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -52,7 +53,6 @@ async fn torznab_proxy(
         )
     })?;
 
-    // Check if this is a search query (contains 't' parameter for search)
     let func_type = params.get("t").cloned().unwrap_or_default();
     let modified_body = match func_type.as_str() {
         "search" | "tvsearch" | "movie" => match modify_torznab_response(state, &body).await {
@@ -91,67 +91,53 @@ async fn torznab_proxy(
     })?)
 }
 
-fn get_infohash(item: &Element, doc: &Document) -> Option<String> {
-    let attrs = item
-        .child_elements(&doc)
-        .into_iter()
-        .filter(|el| el.name(&doc) == "torznab:attr" || el.name(&doc) == "attr")
-        .collect::<Vec<_>>();
-
-    for attr in attrs {
-        if let Some(name) = attr.attributes(&doc).get("name") {
-            if name == "infohash" {
-                return attr.attributes(&doc).get("value").map(|v| v.to_lowercase());
-            }
-        }
-    }
-    None
+fn get_infohash_from_item(item_xml: &str) -> Option<String> {
+    let re = Regex::new(r#"<(?:torznab:)?attr\s+name="infohash"\s+value="([^"]+)""#).unwrap();
+    re.captures(item_xml)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_lowercase()))
 }
 
 async fn modify_torznab_response(state: Arc<AppState>, xml_body: &str) -> anyhow::Result<String> {
-    let mut doc = Document::parse_str(xml_body)?;
-    let rss_el = doc.root_element().unwrap();
-    let channel_el = rss_el
-        .child_elements(&doc)
-        .into_iter()
-        .find(|el| el.name(&doc) == "channel")
-        .ok_or_else(|| anyhow::anyhow!("No <channel> element found in the XML"))?;
+    let doc = Document::parse(xml_body)?;
 
-    let items = channel_el
-        .child_elements(&doc)
-        .into_iter()
-        .filter(|el| el.name(&doc) == "item")
-        .collect::<Vec<_>>();
+    let mut hashes = Vec::new();
+    let mut item_positions = Vec::new();
 
-    let hashes = items
-        .iter()
-        .filter_map(|item| get_infohash(item, &doc))
-        .collect::<Vec<_>>();
+    for node in doc.descendants() {
+        if node.has_tag_name("item") {
+            let item_xml = &xml_body[node.range()];
+
+            if let Some(infohash) = get_infohash_from_item(item_xml) {
+                hashes.push(infohash.clone());
+                item_positions.push((node.range(), infohash));
+            }
+        }
+    }
 
     let mut cache_states = state.debrid.check_cached(&hashes).await?;
     tracing::info!("Adding cache states to {} items", cache_states.0.len());
 
-    for item in items {
-        let Some(infohash) = get_infohash(&item, &doc) else {
-            continue;
-        };
+    let mut modified_xml = xml_body.to_string();
 
+    for (range, infohash) in item_positions.into_iter().rev() {
         if cache_states.0.remove(&infohash).is_some() {
-            // add [CACHED] to the front of the name
-            let title_el = item
-                .child_elements(&doc)
-                .into_iter()
-                .find(|el| el.name(&doc) == "title")
-                .ok_or_else(|| anyhow::anyhow!("No <title> element found in the item"))?;
+            let item_xml_original_slice = &xml_body[range.clone()];
+            let title_re = Regex::new(r"(<title>)(.*?)(</title>)").unwrap();
+            if let Some(caps) = title_re.captures(item_xml_original_slice) {
+                let title_content = caps.get(2).unwrap().as_str();
+                let new_title_content = format!("[CACHED] {}", title_content);
+                let new_item_xml_content = title_re.replace(
+                    item_xml_original_slice,
+                    format!("$1{}$3", new_title_content),
+                );
 
-            let title = title_el.text_content(&doc);
-            let new_title = format!("[CACHED] {}", title);
-            title_el.set_text_content(&mut doc, new_title);
+                modified_xml.replace_range(range.start..range.end, &new_item_xml_content);
+            }
         }
     }
 
     assert!(cache_states.0.is_empty(), "Not all cache states were used");
-    Ok(doc.write_str()?)
+    Ok(modified_xml)
 }
 
 pub fn proxy_torznab() -> Router<Arc<AppState>> {

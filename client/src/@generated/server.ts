@@ -18,11 +18,11 @@ export type TorrentState = "Pending" | "Downloading" | "Ready" | "Stalled" | "Er
 const t = initTRPC.create();
 const publicProcedure = t.procedure;
 const appRouter = t.router({
-    delete_torrent: publicProcedure.input((value): DeleteTorrentInput => { throw new Error('Router should not be used') }).mutation((opts): void => { throw new Error('Router should not be used') }),
+    add_torrent: publicProcedure.input((value): AddTorrentInput => { throw new Error('Router should not be used') }).mutation((opts): void => { throw new Error('Router should not be used') }),
+delete_torrent: publicProcedure.input((value): DeleteTorrentInput => { throw new Error('Router should not be used') }).mutation((opts): void => { throw new Error('Router should not be used') }),
 get_torrent_files: publicProcedure.input((value): GetTorrentFilesInput => { throw new Error('Router should not be used') }).output((value): TorrentFile[] => { throw new Error('Router should not be used') }).query((opts): TorrentFile[] => { throw new Error('Router should not be used') }),
 get_torrents: publicProcedure.output((value): Torrent[] => { throw new Error('Router should not be used') }).query((opts): Torrent[] => { throw new Error('Router should not be used') }),
-reconcile_torrents: publicProcedure.mutation((opts): void => { throw new Error('Router should not be used') }),
-add_torrent: publicProcedure.input((value): AddTorrentInput => { throw new Error('Router should not be used') }).mutation((opts): void => { throw new Error('Router should not be used') })
+reconcile_torrents: publicProcedure.mutation((opts): void => { throw new Error('Router should not be used') })
 });
 
 export type AppRouter = typeof appRouter;
