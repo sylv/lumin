@@ -1,7 +1,7 @@
 use super::nodes;
-use sea_orm::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::OnConflict;
+use sea_orm::{DatabaseTransaction, Set};
 use serde::Serialize;
 use specta::Type;
 
@@ -48,9 +48,9 @@ impl Related<super::torrents::Entity> for Entity {
 impl ActiveModelBehavior for ActiveModel {}
 
 impl Model {
-    pub async fn create_downloads_dir_node(
+    pub async fn add_to_downloads_folder(
         &self,
-        db: &sea_orm::DatabaseConnection,
+        db: &DatabaseTransaction,
     ) -> Result<(), sea_orm::DbErr> {
         let parts = self.path.split('/').collect::<Vec<&str>>();
         let parts_len = parts.len();
@@ -60,7 +60,7 @@ impl Model {
             let name = <&str as ToString>::to_string(part);
             let mut node = nodes::ActiveModel {
                 parent_id: Set(Some(parent_id)),
-                is_automatic: Set(true),
+                immutable: Set(true),
                 name: Set(name),
                 ..Default::default()
             };

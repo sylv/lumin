@@ -19,8 +19,10 @@ import {
 	Share2Icon,
 	CircleIcon,
 	RadiusIcon,
+	Loader2,
 } from "lucide-react";
 import clsx from "clsx";
+import { Button } from "./ui/button";
 
 interface TorrentItemProps {
 	torrent: Torrent;
@@ -66,48 +68,80 @@ export default function TorrentItem({ torrent }: TorrentItemProps) {
 	);
 
 	const utils = trpc.useUtils();
+	const deleteTorrentMutation = trpc.delete_torrent.useMutation({
+		onSuccess: () => {
+			utils.get_torrents.invalidate();
+		},
+	});
+
 	const toggleExpand = () => setIsExpanded(!isExpanded);
+
+	const handleDelete = (e: React.MouseEvent) => {
+		e.stopPropagation();
+		if (confirm(`Are you sure you want to delete "${torrent.name}"?`)) {
+			deleteTorrentMutation.mutate({ torrent_id: torrent.id });
+		}
+	};
 
 	return (
 		<div className="border mb-2">
-			<button
-				type="button"
-				className="cursor-pointer w-full text-left p-3 hover:bg-zinc-900/50"
-				onClick={toggleExpand}
-			>
-				<div className="flex gap-2 flex-col">
-					<div className="flex items-center gap-2">
-						<span
-							className={clsx(
-								"font-mono text-sm lowercase border px-2",
-								getStatusColour(torrent.state),
-							)}
-						>
-							{torrent.state}
-						</span>
-						<span className="font-semibold">{torrent.name}</span>
+			<div className="flex items-center">
+				<button
+					type="button"
+					className="cursor-pointer flex-1 text-left p-3 hover:bg-zinc-900/50"
+					onClick={toggleExpand}
+				>
+					<div className="flex gap-2 flex-col">
+						<div className="flex items-center gap-2">
+							<span
+								className={clsx(
+									"font-mono text-sm lowercase border px-2",
+									getStatusColour(torrent.state),
+								)}
+							>
+								{torrent.state}
+							</span>
+							<span className="font-semibold">{torrent.name}</span>
+						</div>
+						<div className="flex items-center gap-4 text-xs text-zinc-400">
+							<div className="flex items-center gap-1" title="Torrent size">
+								<DownloadIcon className="h-3.5 w-3.5" />
+								{(torrent.progress * 100).toFixed(2)}% of{" "}
+								{formatBytes(torrent.size)}
+							</div>
+							<div className="flex items-center gap-1" title="Ratio">
+								<CircleFadingArrowUpIcon className="h-3.5 w-3.5" />
+								{torrent.ratio.toFixed(2)}
+							</div>
+							<div className="flex items-center gap-1" title="Peers">
+								<BlendIcon className="h-3.5 w-3.5" />
+								{torrent.peers.toLocaleString()} peers
+							</div>
+							<div className="flex items-center gap-1" title="Seeds">
+								<RadiusIcon className="h-3.5 w-3.5" />
+								{torrent.seeds.toLocaleString()} seeds
+							</div>
+						</div>
 					</div>
-					<div className="flex items-center gap-4 text-xs text-zinc-400">
-						<div className="flex items-center gap-1" title="Torrent size">
-							<DownloadIcon className="h-3.5 w-3.5" />
-							{(torrent.progress * 100).toFixed(2)}% of{" "}
-							{formatBytes(torrent.size)}
-						</div>
-						<div className="flex items-center gap-1" title="Ratio">
-							<CircleFadingArrowUpIcon className="h-3.5 w-3.5" />
-							{torrent.ratio.toFixed(2)}
-						</div>
-						<div className="flex items-center gap-1" title="Peers">
-							<BlendIcon className="h-3.5 w-3.5" />
-							{torrent.peers.toLocaleString()} peers
-						</div>
-						<div className="flex items-center gap-1" title="Seeds">
-							<RadiusIcon className="h-3.5 w-3.5" />
-							{torrent.seeds.toLocaleString()} seeds
-						</div>
-					</div>
+				</button>
+				<div className="p-3">
+					<Button
+						variant="outline"
+						size="sm"
+						onClick={handleDelete}
+						disabled={
+							deleteTorrentMutation.isPending || torrent.state === "Removing"
+						}
+						className="text-red-400 hover:text-red-300 hover:bg-red-950/20"
+					>
+						{deleteTorrentMutation.isPending ? (
+							<Loader2 className="h-4 w-4 animate-spin" />
+						) : (
+							<Trash2 className="h-4 w-4" />
+						)}
+					</Button>
 				</div>
-			</button>
+			</div>
 			{isExpanded && (
 				<div className="p-3 border-t border-border-color bg-background-secondary">
 					{filesLoading && <p>Loading files...</p>}

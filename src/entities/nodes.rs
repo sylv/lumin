@@ -15,7 +15,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub name: String,
     pub size: i64,
-    pub is_automatic: bool,
+    pub immutable: bool,
     pub torrent_id: Option<i64>,
     pub file_id: Option<i64>,
     pub created_at: i64,

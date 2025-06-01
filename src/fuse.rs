@@ -105,17 +105,35 @@ impl Filesystem for LuminFS {
     async fn mkdir(
         &self,
         _req: Request,
-        parent: u64,
+        parent_id: u64,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
-        trace!("mkdir(parent={}, name={:?})", parent, name);
+        trace!("mkdir(parent={}, name={:?})", parent_id, name);
+        let Some(parent) = nodes::Entity::find_by_id(parent_id as i64)
+            .one(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::error!("mkdir db error: {}", e);
+                fuse3::Errno::from(libc::EIO)
+            })?
+        else {
+            return Err(libc::ENOENT.into());
+        };
+
+        if parent.file_id.is_some() {
+            // Cannot create a directory inside a file
+            return Err(libc::ENOTDIR.into());
+        }
+
+        if parent.immutable {}
+
         let name_str = name.to_string_lossy().to_string();
         let node = nodes::Entity::insert(nodes::ActiveModel {
-            parent_id: Set(Some(parent as i64)),
+            parent_id: Set(Some(parent_id as i64)),
             name: Set(name_str),
-            is_automatic: Set(false),
+            immutable: Set(false),
             ..Default::default()
         })
         .exec_with_returning(&self.db)
@@ -136,21 +154,37 @@ impl Filesystem for LuminFS {
     async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> Result<()> {
         trace!("rmdir(parent={}, name={:?})", parent, name);
         let name_str = name.to_string_lossy();
-        let result = nodes::Entity::delete_many()
+        let to_delete = nodes::Entity::find()
             .filter(nodes::Column::ParentId.eq(parent as i64))
             .filter(nodes::Column::Name.eq(name_str))
-            // ensure we only delete directories
-            .filter(nodes::Column::FileId.is_null())
-            .exec(&self.db)
+            .one(&self.db)
             .await
             .map_err(|e| {
                 tracing::error!("rmdir db error: {}", e);
                 fuse3::Errno::from(libc::EIO)
             })?;
 
-        if result.rows_affected == 0 {
+        let Some(to_delete) = to_delete else {
             return Err(libc::ENOENT.into());
+        };
+
+        if to_delete.immutable {
+            // download folder nodes are immutable
+            return Err(libc::EPERM.into());
         }
+
+        if to_delete.file_id.is_some() {
+            // this is not a directory
+            return Err(libc::ENOTDIR.into());
+        }
+
+        nodes::Entity::delete_by_id(to_delete.id)
+            .exec(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::error!("rmdir db error: {}", e);
+                fuse3::Errno::from(libc::EIO)
+            })?;
 
         Ok(())
     }
@@ -182,7 +216,7 @@ impl Filesystem for LuminFS {
             size: Set(node.size),
             file_id: Set(node.file_id.clone()),
             torrent_id: Set(node.torrent_id.clone()),
-            is_automatic: Set(false),
+            immutable: Set(false),
             ..Default::default()
         })
         .exec_with_returning(&self.db)
@@ -207,21 +241,36 @@ impl Filesystem for LuminFS {
             return Ok(());
         }
 
-        let result = nodes::Entity::delete_many()
+        let Some(to_delete) = nodes::Entity::find()
             .filter(nodes::Column::ParentId.eq(parent as i64))
             .filter(nodes::Column::Name.eq(name_str))
-            // ensure we only delete files
-            .filter(nodes::Column::FileId.is_not_null())
+            .one(&self.db)
+            .await
+            .map_err(|e| {
+                tracing::error!("unlink db error: {}", e);
+                fuse3::Errno::from(libc::EIO)
+            })?
+        else {
+            return Err(libc::ENOENT.into());
+        };
+
+        if to_delete.immutable {
+            // download folder nodes are immutable
+            return Err(libc::EPERM.into());
+        }
+
+        if to_delete.file_id.is_none() {
+            // cannot unlink directories
+            return Err(libc::EPERM.into());
+        }
+
+        nodes::Entity::delete_by_id(to_delete.id)
             .exec(&self.db)
             .await
             .map_err(|e| {
                 tracing::error!("unlink db error: {}", e);
                 fuse3::Errno::from(libc::EIO)
             })?;
-
-        if result.rows_affected == 0 {
-            return Err(libc::ENOENT.into());
-        }
 
         Ok(())
     }

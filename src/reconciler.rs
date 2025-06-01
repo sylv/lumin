@@ -2,11 +2,10 @@ use crate::config::get_config;
 use crate::debrid::Debrid;
 use crate::entities::torrents::TorrentState;
 use crate::entities::{nodes, torrent_files, torrents};
-use crate::helpers::block_torrent::block_torrent;
 use crate::helpers::should_ignore_path::should_ignore_path;
 use anyhow::Result;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{DatabaseConnection, IntoActiveModel};
+use sea_orm::{DatabaseConnection, IntoActiveModel, TransactionTrait};
 use sea_orm::{Set, prelude::*};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use tokio::time::sleep;
 
 const RECHECK_INTERVAL_SECS: u64 = 10 * 60; // 10 minutes
 const MIN_RECHECK_INTERVAL_SECS: u64 = 30; // 30 seconds
+const UNSAFE_EXTS: [&str; 7] = [".exe", ".msi", ".bat", ".lnk", ".cmd", ".sh", ".ps1"];
 
 pub async fn start_reconciler(
     db: &DatabaseConnection,
@@ -43,14 +43,20 @@ pub async fn start_reconciler(
             // connection, it means inner queries will block indefinitely.
             let local_torrents = torrents::Entity::find().all(db).await?;
             for local_torrent in local_torrents {
-                let ref_count = nodes::Entity::find()
+                let total_ref_count = nodes::Entity::find()
                     .filter(nodes::Column::TorrentId.eq(local_torrent.id.clone()))
+                    .count(db)
+                    .await?;
+
+                let mutable_ref_count = nodes::Entity::find()
+                    .filter(nodes::Column::TorrentId.eq(local_torrent.id.clone()))
+                    .filter(nodes::Column::Immutable.eq(false))
                     .count(db)
                     .await?;
 
                 // files_created check is necessary or else when we add a torrent, we instantly remove it.
                 // we have to wait until the files are created in the download dir.
-                let initial_state = if local_torrent.files_created && ref_count == 0 {
+                let initial_state = if local_torrent.files_created && total_ref_count == 0 {
                     // remove torrents with no references, they are essentially dead.
                     tracing::info!(
                         "Torrent {} has no references, marking for removal",
@@ -64,9 +70,14 @@ pub async fn start_reconciler(
                 let debrid_torrent = match remote_torrents.remove(&local_torrent.hash) {
                     Some(torrent) => torrent,
                     None => {
-                        if initial_state == TorrentState::Removing {
+                        if initial_state == TorrentState::Removing
+                            || (local_torrent.files_created && mutable_ref_count == 0)
+                        {
                             // https://tenor.com/bYVT6.gif
-                            tracing::debug!("Removing torrent {}", local_torrent.hash);
+                            tracing::warn!(
+                                "Removing torrent {} as it was removed from debrid and isn't important",
+                                local_torrent.hash
+                            );
                             torrents::Entity::delete_by_id(local_torrent.id)
                                 .exec(db)
                                 .await?;
@@ -77,10 +88,7 @@ pub async fn start_reconciler(
                         // torrent does not exist on the debrid service, we need to add it
                         let created_torrent =
                             debrid.create_from_magnet(&local_torrent.magnet_uri).await?;
-                        // todo: this is only necessary if the torrent is cached (to immediately update the state, instead of on the next loop),
-                        // and we know if its cached when we add it. we should have a "cache_hint" property on the torrent and if false,
-                        // we skip this step and assume it's in a Pending state until the next loop, because thats
-                        // what torrents will usually be in for awhile unless they're cached
+
                         debrid.get_torrent_info(&created_torrent.torrent_id).await?
                     }
                 };
@@ -104,20 +112,38 @@ pub async fn start_reconciler(
                             // everyone that downloads it in the future. we can't stream data from a zip, so we have to block
                             // these torrents. there should be a better way to handle this.
                             tracing::warn!(
-                                "Torrent {} was zipped and cannot be streamed, blocking it",
+                                "Torrent {} was zipped and cannot be streamed, marking it as failed",
                                 local_torrent.hash
                             );
-                            block_torrent(
-                                db.clone(),
-                                local_torrent.id,
-                                &local_torrent.hash,
-                                "Zipped torrent cannot be streamed",
-                            )
-                            .await?;
+                            let mut local_torrent = local_torrent.into_active_model();
+                            local_torrent.state = Set(TorrentState::Error);
+                            local_torrent.error_message =
+                                Set(Some("Zipped torrent cannot be streamed".to_string()));
+                            local_torrent.save(db).await?;
+                            continue;
+                        }
+
+                        let all_unsafe = files.iter().all(|file| {
+                            UNSAFE_EXTS
+                                .iter()
+                                .any(|ext| file.name.to_lowercase().ends_with(ext))
+                        });
+
+                        if all_unsafe {
+                            tracing::warn!(
+                                "Torrent {} contains unsafe files, marking it as failed",
+                                local_torrent.hash
+                            );
+                            let mut local_torrent = local_torrent.into_active_model();
+                            local_torrent.state = Set(TorrentState::Error);
+                            local_torrent.error_message =
+                                Set(Some("Torrent contains only unsafe files".to_string()));
+                            local_torrent.save(db).await?;
                             continue;
                         }
 
                         files_created = true;
+                        let tx = db.begin().await?;
                         for file in files.into_iter() {
                             if should_ignore_path(&file.name) {
                                 tracing::warn!(
@@ -148,11 +174,13 @@ pub async fn start_reconciler(
                                     ])
                                     .to_owned(),
                                 )
-                                .exec_with_returning(db)
+                                .exec_with_returning(&tx)
                                 .await?;
 
-                            file.create_downloads_dir_node(db).await?;
+                            file.add_to_downloads_folder(&tx).await?;
                         }
+
+                        tx.commit().await?;
                     }
                 }
 
@@ -177,16 +205,16 @@ pub async fn start_reconciler(
 
                     if can_download.is_none() {
                         tracing::warn!(
-                            "Torrent {} is ready, but download link is broken. Blocking it",
+                            "Torrent {} has become Ready but its download link is broken. Marking it as failed",
                             local_torrent.hash
                         );
-                        block_torrent(
-                            db.clone(),
-                            local_torrent.id,
-                            &local_torrent.hash,
-                            "Torbox download url error",
-                        )
-                        .await?;
+                        let mut local_torrent = local_torrent.into_active_model();
+                        local_torrent.state = Set(TorrentState::Error);
+                        local_torrent.error_message = Set(Some(
+                            "Failed to create download link for torrent, its likely corrupted"
+                                .to_string(),
+                        ));
+                        local_torrent.save(db).await?;
                         continue;
                     }
                 }

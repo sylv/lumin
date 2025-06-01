@@ -89,11 +89,8 @@ at this point you'll want to open sonarr and manually search for something. it s
 ## todo
 
 - Usenet support
-- Remove blocked torrents from torznab responses
-- If torrents are downloading, increase the reconciler interval
+- If torrents are downloading, increase the reconciler interval (based on eta?)
 - Button to delete unused debrid torrents
-- Instead of blocking torrents, mark as errored and add error message with reason
-- If a torrent contains only .lnk/.exe/etc files, block it.
 - Predictive preloading
   - Extract the season/episode number from the file and find the next episode, then pre-load a more significant portion of that file for "instant" playback.
   - Should only trigger when you're say, 80%-95% of the way through the current episode.

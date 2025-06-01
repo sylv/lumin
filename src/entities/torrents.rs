@@ -1,5 +1,6 @@
+use super::torrent_files;
 use crate::{config::get_config, qbittorrent::QBittorrentTorrent};
-use sea_orm::entity::prelude::*;
+use sea_orm::{DatabaseTransaction, entity::prelude::*};
 use serde::Serialize;
 use specta::Type;
 
@@ -33,6 +34,7 @@ pub struct Model {
     pub updated_at: i64,
     pub checked_at: Option<i64>,
     pub finished_at: Option<i64>,
+    pub orphaned: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -82,6 +84,19 @@ impl Model {
             inactive_seeding_time_limit: None,
             last_activity: self.updated_at as u64,
         }
+    }
+
+    pub async fn add_to_downloads_folder(&self, db: &DatabaseTransaction) -> Result<(), DbErr> {
+        let files = torrent_files::Entity::find()
+            .filter(torrent_files::Column::TorrentId.eq(self.id))
+            .all(db)
+            .await?;
+
+        for file in files {
+            file.add_to_downloads_folder(db).await?;
+        }
+
+        Ok(())
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::AppState;
 use crate::config::get_config;
 use crate::entities::torrents::TorrentState;
-use crate::entities::{nodes, torrent_blocks, torrent_files, torrents};
+use crate::entities::{nodes, torrent_files, torrents};
 use crate::error::AppError;
 use crate::helpers::add_trackers_to_magnet_uri::add_trackers_to_magnet_uri;
 use crate::helpers::parse_magnet_uri::parse_magnet_uri;
@@ -107,9 +107,7 @@ async fn torrents_info(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QBTorrentsInfoRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut torrents =
-        torrents::Entity::find().filter(torrents::Column::State.ne(TorrentState::Removing));
-
+    let mut torrents = torrents::Entity::find().filter(torrents::Column::Orphaned.eq(false));
     if let Some(category) = query.category {
         torrents = torrents.filter(torrents::Column::Category.eq(category));
     }
@@ -135,7 +133,7 @@ async fn torrents_files(
 ) -> Result<Response, AppError> {
     let Some(torrent) = torrents::Entity::find()
         .filter(torrents::Column::Hash.eq(&query.hash))
-        .filter(torrents::Column::State.ne(TorrentState::Removing))
+        .filter(torrents::Column::Orphaned.eq(false))
         .one(&state.db)
         .await?
     else {
@@ -175,7 +173,7 @@ async fn torrent_properties(
 ) -> Result<Response, AppError> {
     let Some(torrent) = torrents::Entity::find()
         .filter(torrents::Column::Hash.eq(&query.hash))
-        .filter(torrents::Column::State.ne(TorrentState::Removing))
+        .filter(torrents::Column::Orphaned.eq(false))
         .one(&state.db)
         .await?
     else {
@@ -232,13 +230,13 @@ async fn torrents_delete(
 
         let references = nodes::Entity::find()
             .filter(nodes::Column::TorrentId.eq(torrent.id))
-            .filter(nodes::Column::IsAutomatic.eq(false))
+            .filter(nodes::Column::Immutable.eq(false))
             .count(&tx)
             .await?;
 
         if references == 0 {
             // if the file has no nodes referencing it (aside from the download nodes),
-            // we can mark it for removal.
+            // we can mark it for removal because we don't need it.
             torrents::Entity::update(torrents::ActiveModel {
                 id: Set(torrent.id),
                 state: Set(TorrentState::Removing),
@@ -247,22 +245,23 @@ async fn torrents_delete(
             .exec(&tx)
             .await?;
         } else {
-            // however, if there are nodes outside downloads referencing it,
-            // the torrent is still being used for *something* and we want to keep it around.
-            // todo: it could be possible that eg, the episodes from the torrent are deleted but not the subtitle
-            // files, in which case we should still allow the torrent to be removed.
-            if torrent.category.is_some() {
-                // todo: sonarr might try constantly remove the torrent because it will still show in the
-                // torrents list. removing the category should help, assuming sonarr filters by its label,
-                // but this also means labels are required to be configured with sonarr.
-                torrents::Entity::update(torrents::ActiveModel {
-                    id: Set(torrent.id),
-                    category: Set(None),
-                    ..Default::default()
-                })
+            // torrent will be orphaned, which will remove its files from the downloads folder
+            // but will keep the torrent synced and will let files outside the downloads folder
+            // linking to it to still work.
+            torrents::Entity::update(torrents::ActiveModel {
+                id: Set(torrent.id),
+                orphaned: Set(true),
+                ..Default::default()
+            })
+            .exec(&tx)
+            .await?;
+
+            // delete nodes in the download folder
+            nodes::Entity::delete_many()
+                .filter(nodes::Column::TorrentId.eq(torrent.id))
+                .filter(nodes::Column::Immutable.eq(true))
                 .exec(&tx)
                 .await?;
-            }
         }
     }
 
@@ -287,19 +286,6 @@ async fn add_torrent(
                 .into_response());
         };
 
-        let is_blocked = torrent_blocks::Entity::find()
-            .filter(torrent_blocks::Column::Hash.eq(&meta.hash))
-            .one(&tx)
-            .await?;
-
-        if let Some(block) = is_blocked {
-            let reason = format!(
-                "Torrent {} is blocked because of {}",
-                meta.hash, block.block_reason
-            );
-            return Ok((StatusCode::FORBIDDEN, Json(json!({"error": reason}))).into_response());
-        }
-
         let existing = torrents::Entity::find()
             .filter(torrents::Column::Hash.eq(&meta.hash))
             .one(&tx)
@@ -318,6 +304,7 @@ async fn add_torrent(
                 .await?;
             }
 
+            existing.add_to_downloads_folder(&tx).await?;
             return Ok(StatusCode::OK.into_response());
         }
 
