@@ -14,7 +14,7 @@ use axum::routing::{any, get, post};
 use axum::{Form, Json, Router};
 use reqwest::StatusCode;
 use rs_torrent_magnet::magnet_from_torrent;
-use sea_orm::prelude::*;
+use sea_orm::{IntoActiveModel, prelude::*};
 use sea_orm::{Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -292,19 +292,19 @@ async fn add_torrent(
             .await?;
 
         if let Some(existing) = existing {
-            // todo: ensure the files still exist on disk under the downloads dir
-            if existing.category != category {
-                // if the torrent already exists but has a different category, update it
-                torrents::Entity::update(torrents::ActiveModel {
-                    id: Set(existing.id),
-                    category: Set(category),
-                    ..Default::default()
-                })
-                .exec(&tx)
-                .await?;
+            existing.add_to_downloads_folder(&tx).await?;
+
+            let change_state = existing.state == TorrentState::Removing;
+            let mut existing = existing.into_active_model();
+            if change_state {
+                existing.state = Set(TorrentState::Pending);
             }
 
-            existing.add_to_downloads_folder(&tx).await?;
+            existing.orphaned = Set(false);
+            existing.category = Set(category);
+            existing.save(&tx).await?;
+
+            tx.commit().await?;
             return Ok(StatusCode::OK.into_response());
         }
 

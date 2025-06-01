@@ -105,8 +105,21 @@ pub async fn start_reconciler(
                 }
 
                 let mut files_created = false;
-                if !local_torrent.files_created {
-                    if let Some(files) = debrid_torrent.files {
+                let mut dir_name = None;
+                if let Some(files) = debrid_torrent.files {
+                    if files.len() == 0 {
+                        tracing::warn!(
+                            "Torrent {} has no files, this will cause issues",
+                            local_torrent.hash
+                        );
+                    }
+
+                    dir_name = files
+                        .first()
+                        .and_then(|file| file.name.split_once('/'))
+                        .map(|(dir, _)| dir.to_string());
+
+                    if !local_torrent.files_created && files.len() > 0 {
                         if files.len() == 1 && files[0].name.ends_with(".zip") {
                             // todo: if a user adds a torrent with allow_zip: true and it is zipped, the torrent is zipped for
                             // everyone that downloads it in the future. we can't stream data from a zip, so we have to block
@@ -142,7 +155,6 @@ pub async fn start_reconciler(
                             continue;
                         }
 
-                        files_created = true;
                         let tx = db.begin().await?;
                         for file in files.into_iter() {
                             if should_ignore_path(&file.name) {
@@ -181,6 +193,7 @@ pub async fn start_reconciler(
                         }
 
                         tx.commit().await?;
+                        files_created = true;
                     }
                 }
 
@@ -233,7 +246,6 @@ pub async fn start_reconciler(
 
                 let mut local_torrent = local_torrent.into_active_model();
                 local_torrent.state = Set(next_state);
-                local_torrent.name = Set(debrid_torrent.name);
                 local_torrent.remote_id = Set(Some(remote_id));
                 local_torrent.progress = Set(debrid_torrent.progress);
                 local_torrent.upload_speed = Set(debrid_torrent.upload_speed);
@@ -245,6 +257,13 @@ pub async fn start_reconciler(
                 local_torrent.size = Set(debrid_torrent.size as i64);
                 local_torrent.checked_at = Set(Some(chrono::Utc::now().timestamp_millis()));
                 local_torrent.updated_at = Set(chrono::Utc::now().timestamp_millis());
+
+                // the torrent name has to match the directory name on disk.
+                // debrid_torrent.name doesn't always match, which causes mismatches with sonarr
+                // and fucks things up.
+                if let Some(dir_name) = dir_name {
+                    local_torrent.name = Set(dir_name);
+                }
 
                 if !has_finished && next_state == TorrentState::Ready {
                     local_torrent.finished_at = Set(Some(chrono::Utc::now().timestamp_millis()));

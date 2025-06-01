@@ -127,7 +127,11 @@ impl Filesystem for LuminFS {
             return Err(libc::ENOTDIR.into());
         }
 
-        if parent.immutable {}
+        if parent.immutable && parent.id != 1 {
+            // cannot create directories inside immutable nodes
+            // (except the root node, that would be a little silly)
+            return Err(libc::EPERM.into());
+        }
 
         let name_str = name.to_string_lossy().to_string();
         let node = nodes::Entity::insert(nodes::ActiveModel {

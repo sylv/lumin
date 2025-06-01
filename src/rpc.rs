@@ -14,7 +14,7 @@ use juno::{
     router::RpcRouter,
     rpc,
 };
-use sea_orm::{Set, TransactionTrait, prelude::*};
+use sea_orm::{IntoActiveModel, Set, TransactionTrait, prelude::*};
 use std::sync::Arc;
 
 #[rpc(query)]
@@ -75,21 +75,25 @@ async fn add_torrent(
             .map_err(|e| RpcError::new(RpcStatus::InternalServerError, e.to_string()))?;
 
         if let Some(existing) = existing {
-            // todo: ensure the files still exist on disk under the downloads dir
-            if existing.category != category {
-                // if the torrent already exists but has a different category, update it
-                torrents::Entity::update(torrents::ActiveModel {
-                    id: Set(existing.id),
-                    category: Set(category),
-                    ..Default::default()
-                })
-                .exec(&tx)
-                .await
-                .map_err(|e| RpcError::new(RpcStatus::InternalServerError, e.to_string()))?;
-            }
-
             existing
                 .add_to_downloads_folder(&tx)
+                .await
+                .map_err(|e| RpcError::new(RpcStatus::InternalServerError, e.to_string()))?;
+
+            let change_state = existing.state == TorrentState::Removing;
+            let mut existing = existing.into_active_model();
+            if change_state {
+                existing.state = Set(TorrentState::Pending);
+            }
+
+            existing.orphaned = Set(false);
+            existing.category = Set(category);
+            existing
+                .save(&tx)
+                .await
+                .map_err(|e| RpcError::new(RpcStatus::InternalServerError, e.to_string()))?;
+
+            tx.commit()
                 .await
                 .map_err(|e| RpcError::new(RpcStatus::InternalServerError, e.to_string()))?;
 
