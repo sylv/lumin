@@ -1,5 +1,9 @@
 use super::{chunk::Chunk, entry::CacheEntry, ratelimiter::Ratelimiter};
-use crate::{config::get_config, debrid::Debrid, helpers::get_user_agent::get_user_agent};
+use crate::{
+    config::get_config,
+    debrid::{Debrid, TorboxError},
+    helpers::get_user_agent::get_user_agent,
+};
 use anyhow::Result;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -29,6 +33,8 @@ enum DownloadChunkError {
     StreamError(reqwest::Error), // retryable
     #[error("failed to open file for writing: {0}")]
     IoError(#[from] std::io::Error), // never retried
+    #[error("torbox api error: {0}")]
+    TorboxError(#[from] TorboxError),
     #[error("unrecoverable error while downloading chunks: {0}")]
     GenericError(#[from] anyhow::Error), // never retried
 }
@@ -44,6 +50,7 @@ impl DownloadChunkError {
                 ratelimiter.set_ratelimited_for(5);
                 RESPONSE_ERROR_RETRIES.get(attempts - 1).copied()
             }
+
             DownloadChunkError::FetchError(_) => FETCH_ERROR_RETRIES.get(attempts - 1).copied(),
             DownloadChunkError::ResponseError(_, retryable) => {
                 if *retryable {
@@ -53,7 +60,9 @@ impl DownloadChunkError {
                 }
             }
             DownloadChunkError::StreamError(_) => STREAM_ERROR_RETRIES.get(attempts - 1).copied(),
-            DownloadChunkError::GenericError(_) | DownloadChunkError::IoError(_) => None,
+            DownloadChunkError::GenericError(_)
+            | DownloadChunkError::IoError(_)
+            | DownloadChunkError::TorboxError(_) => None,
         }
     }
 }

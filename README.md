@@ -92,6 +92,7 @@ at this point you'll want to open sonarr and manually search for something. it s
 - Usenet support
 - If torrents are downloading, increase the reconciler interval (based on eta?)
 - Button to delete unused debrid torrents
+- Handle debrid errors better
 - Predictive preloading
   - Extract the season/episode number from the file and find the next episode, then pre-load a more significant portion of that file for "instant" playback.
   - Should only trigger when you're say, 80%-95% of the way through the current episode.

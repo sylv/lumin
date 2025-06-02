@@ -1,5 +1,5 @@
 use crate::config::get_config;
-use crate::debrid::Debrid;
+use crate::debrid::{Debrid, TorboxError};
 use crate::entities::torrents::TorrentState;
 use crate::entities::{nodes, torrent_files, torrents};
 use crate::helpers::should_ignore_path::should_ignore_path;
@@ -7,6 +7,7 @@ use anyhow::Result;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{DatabaseConnection, IntoActiveModel, TransactionTrait};
 use sea_orm::{Set, prelude::*};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +18,11 @@ use tokio::time::sleep;
 const RECHECK_INTERVAL_SECS: u64 = 10 * 60; // 10 minutes
 const MIN_RECHECK_INTERVAL_SECS: u64 = 30; // 30 seconds
 const UNSAFE_EXTS: [&str; 7] = [".exe", ".msi", ".bat", ".lnk", ".cmd", ".sh", ".ps1"];
+
+#[derive(Deserialize)]
+pub struct TorboxActiveLimitErrorData {
+    pub active_limit: u64,
+}
 
 pub async fn start_reconciler(
     db: &DatabaseConnection,
@@ -29,6 +35,8 @@ pub async fn start_reconciler(
     sleep(Duration::from_secs(5)).await;
 
     let mut finished_at = Instant::now();
+    let mut download_limit = None;
+
     loop {
         if !is_scanning.load(Ordering::SeqCst) {
             tracing::debug!("Reconciling torrents");
@@ -38,6 +46,12 @@ pub async fn start_reconciler(
                 .into_iter()
                 .map(|t| (t.hash.to_lowercase(), t))
                 .collect();
+
+            let active_count = remote_torrents
+                .values()
+                .into_iter()
+                .filter(|t| t.active)
+                .count();
 
             // todo: this was using streaming, but it holds the db connection and because we have a single
             // connection, it means inner queries will block indefinitely.
@@ -85,11 +99,49 @@ pub async fn start_reconciler(
                             continue;
                         }
 
-                        // torrent does not exist on the debrid service, we need to add it
-                        let created_torrent =
-                            debrid.create_from_magnet(&local_torrent.magnet_uri).await?;
+                        if let Some(download_limit) = download_limit {
+                            if active_count >= download_limit as usize {
+                                tracing::debug!(
+                                    "Torrent download limit {} hit, not adding torrent {}",
+                                    download_limit,
+                                    local_torrent.hash
+                                );
+                                continue;
+                            }
+                        }
 
-                        debrid.get_torrent_info(&created_torrent.torrent_id).await?
+                        // torrent does not exist on the debrid service, we need to add it
+                        match debrid.create_from_magnet(&local_torrent.magnet_uri).await {
+                            Err(TorboxError::ApiError(api_error)) if download_limit.is_none() => {
+                                if api_error.error == Some("ACTIVE_LIMIT".to_string()) {
+                                    let data: TorboxActiveLimitErrorData =
+                                        serde_json::from_value(api_error.data).unwrap();
+
+                                    tracing::warn!(
+                                        "ACTIVE_LIMIT error hit, limiting active torrents to {}",
+                                        data.active_limit
+                                    );
+
+                                    download_limit = Some(data.active_limit);
+                                    continue;
+                                } else {
+                                    tracing::error!(
+                                        "Failed to create torrent from magnet: {}",
+                                        api_error
+                                    );
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to create torrent from magnet: {}", e);
+                                continue;
+                            }
+                            Ok(created_torrent) => {
+                                debrid.get_torrent_info(&created_torrent.torrent_id).await?
+                            }
+                        }
+                        // let created_torrent =
+                        //     debrid.create_from_magnet(&local_torrent.magnet_uri).await?;
                     }
                 };
 
