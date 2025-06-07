@@ -90,6 +90,7 @@ at this point you'll want to open sonarr and manually search for something. it s
 ## todo
 
 - Usenet support
+- Configurable uid/gid/mode
 - If torrents are downloading, increase the reconciler interval (based on eta?)
 - Button to delete unused debrid torrents
 - Handle debrid errors better

@@ -383,8 +383,13 @@ impl Filesystem for LuminFS {
         _req: Request,
         inode: Inode,
         _fh: Option<u64>,
-        _set_attr: SetAttr,
+        set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
+        trace!(
+            "setattr(inode={}, fh={:?}, set_attr={:?})",
+            inode, _fh, set_attr
+        );
+
         if inode == TEST_INODE {
             return Ok(ReplyAttr {
                 attr: self.get_test_attr(),
@@ -392,7 +397,25 @@ impl Filesystem for LuminFS {
             });
         }
 
-        return Err(libc::ENOSYS.into());
+        let node_result = self.get_node(inode).await;
+        let node = match node_result {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                tracing::debug!("setattr: inode {} not found", inode);
+                return Err(libc::ENOENT.into());
+            }
+            Err(e) => {
+                tracing::error!("setattr: database error fetching inode {}: {}", inode, e);
+                return Err(libc::EIO.into());
+            }
+        };
+
+        // sonarr, when deleting files, appears to change the files attr
+        // so we just kinda.. don't, or else sonarr can't delete files.
+        Ok(ReplyAttr {
+            attr: node.get_attr(),
+            ttl: TTL,
+        })
     }
 
     async fn flush(&self, _req: Request, inode: Inode, _fh: u64, _lock_owner: u64) -> Result<()> {
