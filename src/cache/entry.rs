@@ -165,7 +165,12 @@ impl CacheEntry {
     fn get_preload_chunks(&self) -> Option<Vec<Arc<Chunk>>> {
         let config = get_config();
         if let Some(preload) = config.chunk_preload {
-            let preload_end_index = self.chunks.len() as u64 - preload.1;
+            let total_chunks = self.chunks.len() as u64;
+            if total_chunks <= preload.0 + preload.1 + 1 {
+                return Some(self.chunks.clone());
+            }
+
+            let preload_end_index = total_chunks - preload.1;
             let start_chunks = &self.chunks[0..=preload.0 as usize];
             let end_chunks = &self.chunks[preload_end_index as usize..];
             return Some(
