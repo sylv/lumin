@@ -292,6 +292,10 @@ async fn add_torrent(
             .await?;
 
         if let Some(existing) = existing {
+            tracing::debug!(
+                "Torrent with hash {} already exists, updating it",
+                meta.hash
+            );
             existing.add_to_downloads_folder(&tx).await?;
 
             let change_state = existing.state == TorrentState::Removing;
@@ -301,23 +305,21 @@ async fn add_torrent(
             }
 
             existing.orphaned = Set(false);
-            existing.category = Set(category);
+            existing.category = Set(category.clone());
             existing.save(&tx).await?;
-
-            tx.commit().await?;
-            return Ok(StatusCode::OK.into_response());
+        } else {
+            tracing::debug!("Adding new torrent with hash {}", meta.hash);
+            torrents::Entity::insert(torrents::ActiveModel {
+                hash: Set(meta.hash.clone()),
+                name: Set(meta.name.unwrap_or(meta.hash)),
+                category: Set(category.clone()),
+                state: Set(TorrentState::Pending),
+                magnet_uri: Set(magnet_uri),
+                ..Default::default()
+            })
+            .exec(&tx)
+            .await?;
         }
-
-        torrents::Entity::insert(torrents::ActiveModel {
-            hash: Set(meta.hash.clone()),
-            name: Set(meta.name.unwrap_or(meta.hash)),
-            category: Set(category.clone()),
-            state: Set(TorrentState::Pending),
-            magnet_uri: Set(magnet_uri),
-            ..Default::default()
-        })
-        .exec(&tx)
-        .await?;
     }
 
     tx.commit().await?;
