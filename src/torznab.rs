@@ -13,6 +13,8 @@ use roxmltree::Document;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// todo: cache cached states and only check for new ones
+// todo: probably limit the debrid check to 1 at a time
 async fn torznab_proxy(
     State(state): State<Arc<AppState>>,
     Path((upstream_url, path)): Path<(String, String)>,

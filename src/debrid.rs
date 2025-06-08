@@ -127,9 +127,13 @@ pub struct Debrid {
 impl Debrid {
     pub fn new() -> Self {
         let config = get_config();
-        let limiter = Ratelimiter::builder(10, Duration::from_secs(30))
-            .max_tokens(10)
-            .initial_available(4)
+
+        // it should be okay for this to be pretty low, most user-facing
+        // operations do not go through this (mostly cdn reqs), aside from maybe download
+        // link requests. otherwise its background tasks like the reconciler and torznab proxy.
+        let limiter = Ratelimiter::builder(1, Duration::from_secs(5))
+            .max_tokens(5)
+            .initial_available(2)
             .build()
             .expect("Failed to create rate limiter");
 
@@ -363,6 +367,7 @@ impl Debrid {
         }
     }
 
+    // todo: this sucks ass
     async fn wait(&self) {
         loop {
             if let Err(sleep) = self.limiter.try_wait() {
