@@ -14,8 +14,6 @@ lumin is a debrid proxy that handles streaming files from debrid services like T
 - (Very early) Web UI to manage torrents
 - Some other stuff I'm probably forgetting
 - It works with sonarr at least
-- Torznab proxy to inject cached states into responses
-- [TorBox](https://torbox.app) support too
 
 ## usage
 
@@ -64,22 +62,6 @@ services:
 5. Change the "Category" to "sonarr" or "radarr" exactly
    1. If you get an error similar to "Failed to authenticate with qBittorrent" its likely because the category does not match the labels configured in lumin. If sonarr can't create the label it fails with an auth error.
 6. Click "Test" then "Save"
-
-### proxying torznab
-
-> [!WARNING]
-> This is *only* necessary if you want to prioritize cached content in sonarr or radarr.
-
-if you want to prioritise cached content in sonarr or radarr, you need to proxy the torznab requests to prowlarr or jackett so it can inject cached states into the responses.
-
-1. In Prowlarr, go to `Settings -> Apps`
-2. Click the app you want to be proxied through Lumin and copy the "Prowlarr Server" URL
-3. URL encode the "Prowlarr Server" URL using [an online tool like this](https://www.urlencoder.org/)
-4. Replace the "Prowlarr Server" URL with `LUMIN_URL/torznab/<value>`, for example `http://lumin:8000/torznab/http%3A%2F%2Fprowlarr%3A9696`
-5. Click "Test" then "Save" 
-6. Click "Sync App Indexers"
-
-at this point you'll want to open sonarr and manually search for something. it should work and should show some results with `[CACHED]` at the start of the name, indicating they are cached. you can use that to change how you rank torrents, if you want to prefer cached content.
 
 ### notes
 
