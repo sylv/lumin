@@ -1,20 +1,15 @@
 use super::{
-    chunk::{
-        Chunk, DEFAULT_CHUNK_SIZE, deserialize_chunks, get_chunk_size_from_index, serialize_chunks,
-    },
+    chunk::{Chunk, DEFAULT_CHUNK_SIZE, deserialize_chunks, get_chunk_size_from_index, serialize_chunks},
     downloader::download_contiguous_chunks,
     ratelimiter::Ratelimiter,
     reader::Readers,
 };
-use crate::{config::get_config, debrid::Debrid, entities::torrent_files};
+use crate::{cache::CacheFile, config::get_config, debrid::Debrid};
 use anyhow::Result;
 use std::{
     io::SeekFrom,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, atomic::Ordering},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
@@ -22,51 +17,22 @@ use tokio::{
     time::sleep,
 };
 
-struct ReadAheadTier {
-    after_reading_secs: u64,
-    when_secs_until_uncached: u64,
-    then_buffer_secs: u64,
-}
-
 // read ahead is essentially when we are within READ_AHEAD_START_BYTES of the start of uncached chunks,
 // we download enough chunks to have a buffer of READ_AHEAD_TARGET_BYTES bytes.
-// these are the default values used when a duration hint is not available.
 const READ_AHEAD_START_BYTES: u64 = 24 * 1024 * 1024;
 const READ_AHEAD_TARGET_BYTES: u64 = 64 * 1024 * 1024;
 
-// if we have a duration hint, we use these values instead, which are
-// based on the duration hint and file size. it allows for much more accurate
-// read ahead values and less wasted bandwidth.
-const READ_AHEAD_TIERS: [ReadAheadTier; 2] = [
-    ReadAheadTier {
-        after_reading_secs: 0,
-        when_secs_until_uncached: 10,
-        then_buffer_secs: 60,
-    },
-    ReadAheadTier {
-        after_reading_secs: 30,
-        when_secs_until_uncached: 30,
-        then_buffer_secs: 120,
-    },
-];
-
 pub struct CacheEntry {
-    file: torrent_files::Model,
-    remote_torrent_id: i64,
+    file: CacheFile,
     readers: Readers,
     chunks: Vec<Arc<Chunk>>,
     debrid: Arc<Debrid>,
     ratelimiter: Arc<Ratelimiter>,
-    duration_hint_secs: AtomicU64,
 }
 
 impl CacheEntry {
-    pub fn load(
-        file: torrent_files::Model,
-        remote_torrent_id: i64,
-        debrid: Arc<Debrid>,
-        ratelimiter: Arc<Ratelimiter>,
-    ) -> Self {
+    pub fn load(file: CacheFile, debrid: Arc<Debrid>, ratelimiter: Arc<Ratelimiter>) -> Self {
+        let readers = Readers::new();
         let meta_path = get_config()
             .cache_dir
             .as_ref()
@@ -88,17 +54,12 @@ impl CacheEntry {
             chunks
         };
 
-        let duration_hint_secs = file.duration_hint_secs.unwrap_or(0);
-        let readers = Readers::new();
-
         Self {
             file,
-            remote_torrent_id,
             debrid,
             ratelimiter,
             readers,
             chunks,
-            duration_hint_secs: AtomicU64::new(duration_hint_secs as u64),
         }
     }
 
@@ -110,29 +71,12 @@ impl CacheEntry {
             .join(format!("{}.bin", self.file.id))
     }
 
-    pub fn set_duration_hint_secs(&self, secs: u64) {
-        self.duration_hint_secs.store(secs, Ordering::SeqCst);
-    }
-
-    pub fn get_duration_hint_secs(&self) -> Option<u64> {
-        let secs = self.duration_hint_secs.load(Ordering::SeqCst);
-        if secs > 0 { Some(secs) } else { None }
-    }
-
-    pub fn get_file(&self) -> &torrent_files::Model {
+    pub fn get_file(&self) -> &CacheFile {
         &self.file
     }
 
     pub fn get_chunks(&self) -> &[Arc<Chunk>] {
         &self.chunks
-    }
-
-    pub fn get_remote_ids(&self) -> (i64, i64) {
-        (self.remote_torrent_id, self.file.remote_id)
-    }
-
-    pub fn has_cached_chunks(&self) -> bool {
-        self.chunks.iter().any(|c| c.cached.load(Ordering::SeqCst))
     }
 
     fn get_meta_path(&self) -> PathBuf {
@@ -185,34 +129,9 @@ impl CacheEntry {
         None
     }
 
-    fn get_read_ahead_chunks(
-        &self,
-        current_chunk_idx: u64,
-        reader_bytes_read: u64,
-    ) -> Option<Vec<Arc<Chunk>>> {
-        let duration_hint_secs = self.duration_hint_secs.load(Ordering::SeqCst);
-        let (read_ahead_trigger, read_ahead_target) = if duration_hint_secs > 0 {
-            let bytes_per_sec = self.file.size as u64 / duration_hint_secs as u64;
-            let seconds_read = reader_bytes_read / bytes_per_sec;
-            tracing::trace!("reader seconds read: {}", seconds_read);
-
-            let tier = READ_AHEAD_TIERS
-                .iter()
-                .rev()
-                .find(|tier| seconds_read >= tier.after_reading_secs)
-                .expect("failed to find a valid read ahead tier");
-
-            // todo: account for time-to-first-byte
-            let read_ahead_start = bytes_per_sec * tier.when_secs_until_uncached;
-            let read_ahead_target = bytes_per_sec * tier.then_buffer_secs;
-            (read_ahead_start, read_ahead_target)
-        } else {
-            // if we don't have a duration hint, we have to use the default values
-            (READ_AHEAD_START_BYTES, READ_AHEAD_TARGET_BYTES)
-        };
-
-        let read_ahead_trigger_chunks = (read_ahead_trigger / DEFAULT_CHUNK_SIZE).max(1);
-        let read_ahead_target_chunks = (read_ahead_target / DEFAULT_CHUNK_SIZE).max(2);
+    fn get_read_ahead_chunks(&self, current_chunk_idx: u64, reader_bytes_read: u64) -> Option<Vec<Arc<Chunk>>> {
+        let read_ahead_trigger_chunks = (READ_AHEAD_START_BYTES / DEFAULT_CHUNK_SIZE).max(1);
+        let read_ahead_target_chunks = (READ_AHEAD_TARGET_BYTES / DEFAULT_CHUNK_SIZE).max(2);
         tracing::trace!("read ahead trigger: {} chunks", read_ahead_trigger_chunks);
         tracing::trace!("read ahead target: {} chunks", read_ahead_target_chunks);
 
@@ -222,11 +141,7 @@ impl CacheEntry {
         let mut read_ahead_triggered = false;
         let trigger_start_idx = current_chunk_idx + 1;
         let trigger_end_idx = trigger_start_idx + read_ahead_trigger_chunks;
-        tracing::trace!(
-            "read ahead trigger range: {}-{}",
-            trigger_start_idx,
-            trigger_end_idx
-        );
+        tracing::trace!("read ahead trigger range: {}-{}", trigger_start_idx, trigger_end_idx);
         for i in trigger_start_idx..trigger_end_idx {
             let Some(chunk) = self.chunks.get(i as usize) else {
                 break;
@@ -267,8 +182,7 @@ impl CacheEntry {
         let start_chunk_index = offset / DEFAULT_CHUNK_SIZE;
         let end_chunk_index = (offset + size - 1) / DEFAULT_CHUNK_SIZE;
 
-        let mut chunks_to_queue = self.chunks
-            [start_chunk_index as usize..=end_chunk_index as usize]
+        let mut chunks_to_queue = self.chunks[start_chunk_index as usize..=end_chunk_index as usize]
             .iter()
             .map(|c| c.clone())
             .collect::<Vec<_>>();
@@ -315,10 +229,7 @@ impl CacheEntry {
             if let Some(read_ahead_chunks) = read_ahead_chunks {
                 tracing::trace!(
                     "Adding read ahead chunks: {:#?}",
-                    read_ahead_chunks
-                        .iter()
-                        .map(|c| c.index)
-                        .collect::<Vec<_>>()
+                    read_ahead_chunks.iter().map(|c| c.index).collect::<Vec<_>>()
                 );
                 chunks_to_queue.extend(read_ahead_chunks);
                 // chunks_to_queue.sort_by_key(|c| c.index);

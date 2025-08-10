@@ -14,8 +14,16 @@ const BASE_URL: &str = "https://api.torbox.app/v1/api";
 pub struct TorboxApiError {
     pub error: Option<String>,
     pub detail: String,
-    pub data: serde_json::Value,
+    pub data: TorboxApiErrorType,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum TorboxApiErrorType {
+    ActiveLimit { active_limit: u64 },
+    Generic(serde_json::Value),
+}
+
 impl std::fmt::Display for TorboxApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -146,10 +154,7 @@ impl Debrid {
         }
     }
 
-    pub async fn create_from_magnet(
-        &self,
-        magnet_uri: &str,
-    ) -> Result<TorboxCreateTorrentData, TorboxError> {
+    pub async fn create_from_magnet(&self, magnet_uri: &str) -> Result<TorboxCreateTorrentData, TorboxError> {
         info!("Creating torrent from magnet: {}", magnet_uri);
         let url = format!("{}/torrents/createtorrent", BASE_URL);
         let body = json!({ "magnet": magnet_uri, "allow_zip": false });
@@ -184,14 +189,8 @@ impl Debrid {
         Ok(())
     }
 
-    pub async fn get_torrent_info(
-        &self,
-        torrent_id: &u32,
-    ) -> Result<TorboxListTorrent, TorboxError> {
-        let url = format!(
-            "{}/torrents/mylist?bypass_cache=true&id={}",
-            BASE_URL, torrent_id
-        );
+    pub async fn get_torrent_info(&self, torrent_id: &u32) -> Result<TorboxListTorrent, TorboxError> {
+        let url = format!("{}/torrents/mylist?bypass_cache=true&id={}", BASE_URL, torrent_id);
 
         self.wait().await;
         let response = self
@@ -204,10 +203,7 @@ impl Debrid {
         Ok(self.parse_response::<TorboxListTorrent>(response)?)
     }
 
-    pub async fn get_torrent_list(
-        &self,
-        use_cache: bool,
-    ) -> Result<Vec<TorboxListTorrent>, TorboxError> {
+    pub async fn get_torrent_list(&self, use_cache: bool) -> Result<Vec<TorboxListTorrent>, TorboxError> {
         let url = format!("{}/torrents/mylist?bypass_cache={}", BASE_URL, !use_cache);
         self.wait().await;
         let response = self
@@ -220,20 +216,14 @@ impl Debrid {
         Ok(self.parse_response::<Vec<TorboxListTorrent>>(response)?)
     }
 
-    pub async fn check_cached(
-        &self,
-        hashes: &[String],
-    ) -> Result<TorboxInstantAvailability, TorboxError> {
+    pub async fn check_cached(&self, hashes: &[String]) -> Result<TorboxInstantAvailability, TorboxError> {
         let hash_batches = hashes
             .chunks(100)
             .map(|chunk| chunk.join(","))
             .collect::<Vec<_>>()
             .join("&hash=");
 
-        let url = format!(
-            "{}/torrents/checkcached?format=object&hash={}",
-            BASE_URL, hash_batches
-        );
+        let url = format!("{}/torrents/checkcached?format=object&hash={}", BASE_URL, hash_batches);
 
         self.wait().await;
         let response = self
@@ -246,11 +236,7 @@ impl Debrid {
         Ok(self.parse_response::<TorboxInstantAvailability>(response)?)
     }
 
-    pub async fn get_download_link(
-        &self,
-        torrent_id: i64,
-        file_id: i64,
-    ) -> Result<String, TorboxError> {
+    pub async fn get_download_link(&self, torrent_id: i64, file_id: i64) -> Result<String, TorboxError> {
         let file_key = format!("{}:{}", torrent_id, file_id);
         let cached_url = self.get_cached_url(&file_key).await?;
         if let Some(cached_url) = cached_url {
@@ -280,10 +266,7 @@ impl Debrid {
             BASE_URL, torrent_id, file_id, self.token
         );
 
-        info!(
-            "Requesting download link for file: {} via {}",
-            file_key, url
-        );
+        info!("Requesting download link for file: {} via {}", file_key, url);
         self.wait().await;
         let start = Utc::now();
         let response = self
@@ -300,17 +283,9 @@ impl Debrid {
         Ok(data)
     }
 
-    async fn set_cached_url(
-        &self,
-        file_hash: &str,
-        url: &str,
-        expires_at: DateTime<Utc>,
-    ) -> Result<()> {
+    async fn set_cached_url(&self, file_hash: &str, url: &str, expires_at: DateTime<Utc>) -> Result<()> {
         let cached_url = ExpiringItem::new(url.to_string(), expires_at);
-        self.url_cache
-            .lock()
-            .await
-            .insert(file_hash.to_string(), cached_url);
+        self.url_cache.lock().await.insert(file_hash.to_string(), cached_url);
 
         Ok(())
     }
@@ -342,10 +317,7 @@ impl Debrid {
             .header("User-Agent", get_user_agent())
     }
 
-    fn parse_response<T: DeserializeOwned>(
-        &self,
-        mut response: serde_json::Value,
-    ) -> Result<T, TorboxApiError> {
+    fn parse_response<T: DeserializeOwned>(&self, mut response: serde_json::Value) -> Result<T, TorboxApiError> {
         // doing it like this avoids issues with serdes untagged enums,
         // mostly that if the response is a success but deserialization fails,
         // it skips the error and tries to deserialize as an error which then
@@ -357,7 +329,7 @@ impl Debrid {
             let result: T = serde_json::from_value(data).map_err(|e| TorboxApiError {
                 error: Some("Deserialization error".to_string()),
                 detail: e.to_string(),
-                data: data_clone,
+                data: TorboxApiErrorType::Generic(data_clone),
             })?;
 
             Ok(result)

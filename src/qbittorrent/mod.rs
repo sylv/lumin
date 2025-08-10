@@ -1,10 +1,10 @@
 use crate::AppState;
 use crate::config::get_config;
-use crate::entities::torrents::TorrentState;
-use crate::entities::{nodes, torrent_files, torrents};
 use crate::error::AppError;
 use crate::helpers::add_trackers_to_magnet_uri::add_trackers_to_magnet_uri;
 use crate::helpers::parse_magnet_uri::parse_magnet_uri;
+use crate::qbittorrent::torrent::Torrent;
+use crate::state::TorrentState;
 use axum::extract::{FromRequest, Multipart, Query, Request, State};
 use axum::http::Method;
 use axum::http::Uri;
@@ -14,13 +14,20 @@ use axum::routing::{any, get, post};
 use axum::{Form, Json, Router};
 use reqwest::StatusCode;
 use rs_torrent_magnet::magnet_from_torrent;
-use sea_orm::{IntoActiveModel, prelude::*};
-use sea_orm::{Set, TransactionTrait};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
+use sqlx::FromRow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::warn;
+
+mod torrent;
+
+#[derive(FromRow)]
+pub struct TorrentFile {
+    pub path: String,
+    pub size: i64,
+}
 
 pub async fn auth_login() -> impl IntoResponse {
     "Ok."
@@ -51,11 +58,7 @@ async fn app_shutdown() -> impl IntoResponse {
 
 async fn app_preferences() -> impl IntoResponse {
     let config = get_config();
-    let save_path = config
-        .mount_path
-        .join("downloads")
-        .to_string_lossy()
-        .into_owned();
+    let save_path = config.mount_path.join("downloads").to_string_lossy().into_owned();
 
     Json(json!({
         "save_path": save_path,
@@ -72,11 +75,7 @@ async fn app_set_preferences() -> impl IntoResponse {
 
 async fn app_default_save_path() -> impl IntoResponse {
     let config = get_config();
-    config
-        .mount_path
-        .join("downloads")
-        .to_string_lossy()
-        .into_owned()
+    config.mount_path.join("downloads").to_string_lossy().into_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,41 +83,19 @@ struct QBTorrentsInfoRequest {
     pub category: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct QBittorrentTorrent {
-    pub hash: String,
-    pub name: String,
-    pub size: i64,
-    pub progress: f32, // 0.0-1.0
-    #[serde(rename = "eta")]
-    pub eta_secs: u32,
-    pub state: String,
-    pub category: Option<String>,
-    pub save_path: Option<String>,
-    pub ratio: f32,
-    pub ratio_limit: Option<f64>,
-    pub seeding_time: Option<u32>,
-    pub seeding_time_limit: Option<u32>,
-    pub inactive_seeding_time_limit: Option<u32>,
-    pub last_activity: u64,
-}
-
 async fn torrents_info(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QBTorrentsInfoRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut torrents = torrents::Entity::find().filter(torrents::Column::Orphaned.eq(false));
+    let mut sql = "SELECT * FROM torrents WHERE hidden = 0".to_string();
     if let Some(category) = query.category {
-        torrents = torrents.filter(torrents::Column::Category.eq(category));
+        sql += &format!(" AND category = '{}'", category);
     }
 
-    let torrents = torrents.all(&state.db).await?;
+    let torrents = sqlx::query_as::<_, Torrent>(&sql).fetch_all(&state.pool).await?;
 
     Ok(Json(
-        torrents
-            .into_iter()
-            .map(|v| v.to_qbittorrent())
-            .collect::<Vec<_>>(),
+        torrents.into_iter().map(|v| v.to_qbittorrent()).collect::<Vec<_>>(),
     ))
 }
 
@@ -131,22 +108,14 @@ async fn torrents_files(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QBTorrentsHashRequest>,
 ) -> Result<Response, AppError> {
-    let Some(torrent) = torrents::Entity::find()
-        .filter(torrents::Column::Hash.eq(&query.hash))
-        .filter(torrents::Column::Orphaned.eq(false))
-        .one(&state.db)
-        .await?
-    else {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Torrent not found"})),
-        )
-            .into_response());
+    let torrent = Torrent::find_by_hash(&query.hash, &state.pool).await?;
+    let Some(torrent) = torrent else {
+        return Ok((StatusCode::NOT_FOUND, "Torrent not found").into_response());
     };
 
-    let files = torrent_files::Entity::find()
-        .filter(torrent_files::Column::TorrentId.eq(torrent.id))
-        .all(&state.db)
+    let files = sqlx::query_as::<_, TorrentFile>("SELECT * FROM torrent_files WHERE torrent_id = ?")
+        .bind(torrent.id)
+        .fetch_all(&state.pool)
         .await?;
 
     Ok(Json(
@@ -171,17 +140,9 @@ async fn torrent_properties(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QBTorrentsHashRequest>,
 ) -> Result<Response, AppError> {
-    let Some(torrent) = torrents::Entity::find()
-        .filter(torrents::Column::Hash.eq(&query.hash))
-        .filter(torrents::Column::Orphaned.eq(false))
-        .one(&state.db)
-        .await?
-    else {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Torrent not found"})),
-        )
-            .into_response());
+    let torrent = Torrent::find_by_hash(&query.hash, &state.pool).await?;
+    let Some(torrent) = torrent else {
+        return Ok((StatusCode::NOT_FOUND, "Torrent not found").into_response());
     };
 
     let torrent = torrent.to_qbittorrent();
@@ -210,57 +171,32 @@ async fn torrents_delete(
         .collect();
 
     if hashes.is_empty() {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "No hashes provided"})),
-        )
-            .into_response());
+        return Ok((StatusCode::BAD_REQUEST, "No hashes provided").into_response());
     }
 
-    let tx = state.db.begin().await?;
+    let mut tx = state.pool.begin().await?;
 
     for hash in &hashes {
-        let Some(torrent) = torrents::Entity::find()
-            .filter(torrents::Column::Hash.eq(hash))
-            .one(&tx)
-            .await?
-        else {
-            continue;
-        };
-
-        let references = nodes::Entity::find()
-            .filter(nodes::Column::TorrentId.eq(torrent.id))
-            .filter(nodes::Column::Immutable.eq(false))
-            .count(&tx)
-            .await?;
+        let references = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM nodes WHERE readonly = 0 AND torrent_id IN (SELECT id FROM torrents WHERE hash = ?)",
+            hash
+        )
+        .fetch_one(&mut *tx)
+        .await?;
 
         if references == 0 {
             // if the file has no nodes referencing it (aside from the download nodes),
             // we can mark it for removal because we don't need it.
-            torrents::Entity::update(torrents::ActiveModel {
-                id: Set(torrent.id),
-                state: Set(TorrentState::Removing),
-                ..Default::default()
-            })
-            .exec(&tx)
+            sqlx::query!(
+                "UPDATE torrents SET state = ?, hidden = 1 WHERE hash = ?",
+                TorrentState::Removing,
+                hash
+            )
+            .execute(&mut *tx)
             .await?;
         } else {
-            // torrent will be orphaned, which will remove its files from the downloads folder
-            // but will keep the torrent synced and will let files outside the downloads folder
-            // linking to it to still work.
-            torrents::Entity::update(torrents::ActiveModel {
-                id: Set(torrent.id),
-                orphaned: Set(true),
-                ..Default::default()
-            })
-            .exec(&tx)
-            .await?;
-
-            // delete nodes in the download folder
-            nodes::Entity::delete_many()
-                .filter(nodes::Column::TorrentId.eq(torrent.id))
-                .filter(nodes::Column::Immutable.eq(true))
-                .exec(&tx)
+            sqlx::query!("UPDATE torrents SET hidden = 1 WHERE hash = ?", hash)
+                .execute(&mut *tx)
                 .await?;
         }
     }
@@ -274,50 +210,50 @@ async fn add_torrent(
     magnet_uris: Vec<String>,
     category: Option<String>,
 ) -> Result<Response, AppError> {
-    let tx = state.db.begin().await?;
+    let mut tx = state.pool.begin().await?;
 
     for magnet_uri in magnet_uris {
         let magnet_uri = add_trackers_to_magnet_uri(&magnet_uri);
         let Some(meta) = parse_magnet_uri(&magnet_uri) else {
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Invalid magnet URI"})),
-            )
-                .into_response());
+            return Ok((StatusCode::BAD_REQUEST, "Invalid magnet URI").into_response());
         };
 
-        let existing = torrents::Entity::find()
-            .filter(torrents::Column::Hash.eq(&meta.hash))
-            .one(&tx)
-            .await?;
+        let existing = sqlx::query!(
+            r#"SELECT id, state as "state: TorrentState" FROM torrents WHERE hash = ?"#,
+            meta.hash
+        )
+        .fetch_optional(tx.as_mut())
+        .await?;
 
         if let Some(existing) = existing {
-            tracing::debug!(
-                "Torrent with hash {} already exists, updating it",
-                meta.hash
-            );
-            existing.add_to_downloads_folder(&tx).await?;
+            tracing::debug!("Torrent with hash {} already exists, updating it", meta.hash);
 
-            let change_state = existing.state == TorrentState::Removing;
-            let mut existing = existing.into_active_model();
-            if change_state {
-                existing.state = Set(TorrentState::Pending);
-            }
+            let new_state = if existing.state == TorrentState::Removing {
+                TorrentState::Pending
+            } else {
+                existing.state
+            };
 
-            existing.orphaned = Set(false);
-            existing.category = Set(category.clone());
-            existing.save(&tx).await?;
+            sqlx::query!(
+                "UPDATE torrents SET hidden = 0, category = ?, state = ? WHERE id = ?",
+                category,
+                new_state,
+                existing.id
+            )
+            .execute(&mut *tx)
+            .await?;
         } else {
             tracing::debug!("Adding new torrent with hash {}", meta.hash);
-            torrents::Entity::insert(torrents::ActiveModel {
-                hash: Set(meta.hash.clone()),
-                name: Set(meta.name.unwrap_or(meta.hash)),
-                category: Set(category.clone()),
-                state: Set(TorrentState::Pending),
-                magnet_uri: Set(magnet_uri),
-                ..Default::default()
-            })
-            .exec(&tx)
+            let name = meta.name.as_ref().unwrap_or(&meta.hash);
+            sqlx::query!(
+                "INSERT INTO torrents (hash, name, category, state, magnet_uri) VALUES (?, ?, ?, ?, ?)",
+                meta.hash,
+                name,
+                category,
+                TorrentState::Pending,
+                magnet_uri
+            )
+            .execute(&mut *tx)
             .await?;
         }
     }
@@ -338,27 +274,16 @@ async fn torrents_add_get(
     Query(query): Query<QBTorrentsAddRequest>,
 ) -> Result<Response, AppError> {
     let urls = query.urls.as_deref().unwrap_or("");
-    let magnet_uris: Vec<String> = urls
-        .split(',')
-        .filter_map(|s| s.trim().to_string().into())
-        .collect();
+    let magnet_uris: Vec<String> = urls.split(',').filter_map(|s| s.trim().to_string().into()).collect();
 
     if magnet_uris.is_empty() {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "No magnet URIs provided"})),
-        )
-            .into_response());
+        return Ok((StatusCode::BAD_REQUEST, "No magnet URIs provided").into_response());
     }
 
     add_torrent(state, magnet_uris, query.category).await
 }
 
-async fn torrents_add_post(
-    state: State<Arc<AppState>>,
-    parts: Parts,
-    req: Request,
-) -> Result<Response, AppError> {
+async fn torrents_add_post(state: State<Arc<AppState>>, parts: Parts, req: Request) -> Result<Response, AppError> {
     // todo: unwrap heaven, this needs proper error handling
     let content_type = parts
         .headers
@@ -368,9 +293,7 @@ async fn torrents_add_post(
 
     match content_type.split(";").next().unwrap_or("") {
         "application/x-www-form-urlencoded" => {
-            let Form(data) = Form::<QBTorrentsAddRequest>::from_request(req, &state)
-                .await
-                .unwrap();
+            let Form(data) = Form::<QBTorrentsAddRequest>::from_request(req, &state).await.unwrap();
 
             let mut magnet_uris = Vec::new();
             if let Some(urls) = data.urls {
@@ -411,21 +334,13 @@ async fn torrents_add_post(
             }
 
             if magnet_uris.is_empty() {
-                return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": "No magnet URIs provided"})),
-                )
-                    .into_response());
+                return Ok((StatusCode::BAD_REQUEST, "No magnet URIs provided").into_response());
             }
 
             add_torrent(state.0, magnet_uris, category).await
         }
         _ => {
-            return Ok((
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                Json(json!({"error": "Unsupported content type"})),
-            )
-                .into_response());
+            return Ok((StatusCode::UNSUPPORTED_MEDIA_TYPE, "Unsupported content type").into_response());
         }
     }
 }
@@ -440,47 +355,26 @@ async fn torrents_set_category(
     State(state): State<Arc<AppState>>,
     Query(query): Query<QBTorrentsSetCategoryRequest>,
 ) -> Result<Response, AppError> {
-    let hashes: Vec<String> = query
-        .hashes
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    let hashes: Vec<String> = query.hashes.split(',').map(|s| s.trim().to_string()).collect();
 
     if hashes.is_empty() {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "No hashes provided"})),
-        )
-            .into_response());
+        return Ok((StatusCode::BAD_REQUEST, "No hashes provided").into_response());
     }
 
-    let updated = torrents::Entity::update_many()
-        .filter(torrents::Column::Hash.is_in(hashes))
-        .col_expr(
-            torrents::Column::Category,
-            Expr::value(query.category.clone()),
-        )
-        .exec(&state.db)
-        .await?;
-
-    if updated.rows_affected == 0 {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "No torrents found with the provided hashes"})),
-        )
-            .into_response());
+    let mut tx = state.pool.begin().await?;
+    for hash in hashes {
+        sqlx::query!("UPDATE torrents SET category = ? WHERE hash = ?", query.category, hash)
+            .execute(&mut *tx)
+            .await?;
     }
 
+    tx.commit().await?;
     Ok(StatusCode::OK.into_response())
 }
 
 async fn torrents_categories() -> Result<Response, AppError> {
     let config = get_config();
-    let save_path = config
-        .mount_path
-        .join("downloads")
-        .to_string_lossy()
-        .into_owned();
+    let save_path = config.mount_path.join("downloads").to_string_lossy().into_owned();
 
     let mut category_map = HashMap::new();
     for category in &config.categories {
@@ -501,9 +395,7 @@ struct QBTorrentsCreateCategoryRequest {
     pub category: String,
 }
 
-async fn torrents_create_category(
-    Form(request): Form<QBTorrentsCreateCategoryRequest>,
-) -> impl IntoResponse {
+async fn torrents_create_category(Form(request): Form<QBTorrentsCreateCategoryRequest>) -> impl IntoResponse {
     warn!(
         "Attempted to create a torrent category `{}`, you should properly configure your client or add the category manually.",
         request.category
@@ -517,9 +409,7 @@ struct QBTorrentsRemoveCategoryRequest {
     pub categories: String,
 }
 
-async fn torrents_remove_category(
-    Form(request): Form<QBTorrentsRemoveCategoryRequest>,
-) -> impl IntoResponse {
+async fn torrents_remove_category(Form(request): Form<QBTorrentsRemoveCategoryRequest>) -> impl IntoResponse {
     warn!(
         "Attempted to remove torrent categories `{}`, you should properly configure your client or remove the category manually.",
         request.categories
@@ -529,11 +419,7 @@ async fn torrents_remove_category(
 
 async fn fallback(uri: Uri, method: Method) -> impl IntoResponse {
     warn!("Missing implementation for route `{} {}`", method, uri);
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": "Route not implemented"})),
-    )
-        .into_response()
+    (StatusCode::NOT_FOUND, "Route not implemented").into_response()
 }
 
 pub fn mimic_qbittorrent() -> Router<Arc<AppState>> {
@@ -553,23 +439,12 @@ pub fn mimic_qbittorrent() -> Router<Arc<AppState>> {
         .route("/api/v2/torrents/properties", get(torrent_properties))
         .route(
             "/api/v2/torrents/delete",
-            get(torrents_delete)
-                .post(torrents_delete)
-                .delete(torrents_delete),
+            get(torrents_delete).post(torrents_delete).delete(torrents_delete),
         )
-        .route(
-            "/api/v2/torrents/add",
-            get(torrents_add_get).post(torrents_add_post),
-        )
+        .route("/api/v2/torrents/add", get(torrents_add_get).post(torrents_add_post))
         .route("/api/v2/torrents/setCategory", get(torrents_set_category))
         .route("/api/v2/torrents/categories", get(torrents_categories))
-        .route(
-            "/api/v2/torrents/createCategory",
-            post(torrents_create_category),
-        )
-        .route(
-            "/api/v2/torrents/removeCategory",
-            post(torrents_remove_category),
-        )
+        .route("/api/v2/torrents/createCategory", post(torrents_create_category))
+        .route("/api/v2/torrents/removeCategory", post(torrents_remove_category))
         .route("/api/v2/{*path}", any(fallback))
 }

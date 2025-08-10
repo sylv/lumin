@@ -1,11 +1,9 @@
-use crate::entities::torrents;
-use crate::{config::get_config, debrid::Debrid, entities::torrent_files};
+use crate::{config::get_config, debrid::Debrid};
 use anyhow::Result;
 use chunk::{Chunk, ChunkPriority};
 use entry::CacheEntry;
 use ratelimiter::Ratelimiter;
-use sea_orm::DatabaseConnection;
-use sea_orm::prelude::*;
+use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock, atomic::Ordering},
@@ -18,15 +16,23 @@ mod entry;
 mod ratelimiter;
 mod reader;
 
+pub struct CacheFile {
+    pub id: i64,
+    pub size: i64,
+    pub path: String,
+    pub file_debrid_id: i64,
+    pub torrent_debrid_id: i64,
+}
+
 pub struct Cache {
-    db: DatabaseConnection,
+    pool: SqlitePool,
     ratelimiter: Arc<Ratelimiter>,
     debrid: Arc<Debrid>,
     entries: RwLock<HashMap<i64, Arc<CacheEntry>>>,
 }
 
 impl Cache {
-    pub async fn load(db: &DatabaseConnection, debrid: Arc<Debrid>) -> Result<Arc<Self>> {
+    pub async fn load(pool: &SqlitePool, debrid: Arc<Debrid>) -> Result<Arc<Self>> {
         let ratelimiter = Arc::new(Ratelimiter::new());
 
         let cache_dir = get_config().cache_dir.as_ref().unwrap();
@@ -40,25 +46,23 @@ impl Cache {
                 continue;
             }
 
-            let Some(file_id) = file_name
-                .strip_suffix(".bin")
-                .and_then(|s| s.parse::<i64>().ok())
-            else {
-                tracing::warn!(
-                    "Cache file {} does not have a valid ID, skipping it.",
-                    file_name
-                );
+            let Some(file_id) = file_name.strip_suffix(".bin").and_then(|s| s.parse::<i64>().ok()) else {
+                tracing::warn!("Cache file {} does not have a valid ID, skipping it.", file_name);
                 continue;
             };
 
-            // Query using the parsed IDs
-            let result = torrent_files::Entity::find()
-                .filter(torrent_files::Column::Id.eq(file_id))
-                .find_also_related(torrents::Entity)
-                .one(db)
-                .await?;
+            let result = sqlx::query_as!(
+                CacheFile,
+                r#"SELECT tf.id, tf.size, tf.path, tf.debrid_id as file_debrid_id, t.debrid_id as "torrent_debrid_id!"
+                FROM torrent_files tf
+                JOIN torrents t ON t.id = tf.torrent_id
+                WHERE tf.id = ? AND t.debrid_id IS NOT NULL"#,
+                file_id
+            )
+            .fetch_optional(pool)
+            .await?;
 
-            let Some((file, Some(torrent))) = result else {
+            let Some(file) = result else {
                 tracing::warn!(
                     "Cache file {} does not have a corresponding torrent file entry, removing it.",
                     file_name
@@ -71,43 +75,21 @@ impl Cache {
                 continue;
             };
 
-            let Some(torrent_remote_id) = torrent.remote_id else {
-                // this is kinda gross, but its probably temporary so removing the file from the cache
-                // would be a bad move. this should be fine, once the remote_id is added to the torrent,
-                // once read the cache entry will automatically find the existing cache data.
-                // todo: it does mean that this file won't be considered for cache sweeping though.
-                tracing::warn!(
-                    "Cache file {} does not have a remote torrent ID, ignoring it.",
-                    file_name
-                );
-                continue;
-            };
-
             let file_id = file.id;
-            let entry =
-                CacheEntry::load(file, torrent_remote_id, debrid.clone(), ratelimiter.clone());
+            let entry = CacheEntry::load(file, debrid.clone(), ratelimiter.clone());
             entries.insert(file_id, Arc::new(entry));
         }
 
         let entries = RwLock::new(entries);
         Ok(Arc::new(Cache {
-            db: db.clone(),
+            pool: pool.clone(),
             ratelimiter,
             entries,
             debrid,
         }))
     }
 
-    pub fn get_all_entries(&self) -> Vec<Arc<CacheEntry>> {
-        let entries = self.entries.read().unwrap();
-        entries.values().cloned().collect()
-    }
-
-    pub fn upsert_entry(
-        &self,
-        file: torrent_files::Model,
-        remote_torrent_id: i64,
-    ) -> Arc<CacheEntry> {
+    pub fn upsert_entry(&self, file: CacheFile) -> Arc<CacheEntry> {
         let entries = self.entries.read().unwrap();
         if let Some(entry) = entries.get(&file.id) {
             return entry.clone();
@@ -121,13 +103,8 @@ impl Cache {
         }
 
         let file_id = file.id;
-        let entry = Arc::new(CacheEntry::load(
-            file,
-            remote_torrent_id,
-            self.debrid.clone(),
-            self.ratelimiter.clone(),
-        ));
-
+        let entry = CacheEntry::load(file, self.debrid.clone(), self.ratelimiter.clone());
+        let entry = Arc::new(entry);
         entries.insert(file_id, entry.clone());
         entry
     }
@@ -156,9 +133,8 @@ impl Cache {
 
             for entry in entries.into_iter() {
                 let file_id = entry.get_file().id;
-                let file = torrent_files::Entity::find()
-                    .filter(torrent_files::Column::Id.eq(file_id))
-                    .one(&self.db)
+                let file = sqlx::query!(r#"SELECT id FROM torrent_files WHERE id = ?"#, file_id)
+                    .fetch_optional(&self.pool)
                     .await?;
 
                 if file.is_none() {
@@ -173,10 +149,7 @@ impl Cache {
                         }
                         continue;
                     } else {
-                        tracing::info!(
-                            "cached file {} was not removed, but torrent was removed",
-                            file_id
-                        );
+                        tracing::info!("cached file {} was not removed, but torrent was removed", file_id);
                     }
                 }
 

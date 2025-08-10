@@ -123,7 +123,6 @@ async fn download_contiguous_chunks_inner(
 
     let config = get_config();
     let file = entry.get_file();
-    let (remote_torrent_id, remote_file_id) = entry.get_remote_ids();
     let (url, auth) = match (&config.torbox_username, &config.torbox_password) {
         (Some(username), Some(password)) => {
             // with a username nad password, we can use webdav instead which avoids us having to get download links
@@ -143,7 +142,7 @@ async fn download_contiguous_chunks_inner(
             // todo: this should really be a FetchError, but the inner type is not compatible with
             // anyhow and making it return a "real" type is borderline impossible. :(
             let url = debrid
-                .get_download_link(remote_torrent_id, remote_file_id)
+                .get_download_link(file.torrent_debrid_id, file.file_debrid_id)
                 .await?;
 
             (url, None)
@@ -176,10 +175,7 @@ async fn download_contiguous_chunks_inner(
     };
 
     let permit = ratelimiter.wait().await;
-    let response = builder
-        .send()
-        .await
-        .map_err(DownloadChunkError::FetchError)?;
+    let response = builder.send().await.map_err(DownloadChunkError::FetchError)?;
 
     match response.status() {
         StatusCode::PARTIAL_CONTENT => {}
@@ -238,8 +234,7 @@ async fn download_contiguous_chunks_inner(
     let mut current_chunk_index = 0;
 
     // Track which chunk we're currently writing to
-    let mut current_chunk_end_offset =
-        chunks[current_chunk_index].1.offset + chunks[current_chunk_index].1.size;
+    let mut current_chunk_end_offset = chunks[current_chunk_index].1.offset + chunks[current_chunk_index].1.size;
 
     while let Some(block) = response_stream.next().await {
         let block = block.map_err(DownloadChunkError::StreamError)?;
@@ -253,18 +248,12 @@ async fn download_contiguous_chunks_inner(
         // Mark chunks as cached as soon as they're fully downloaded
         while current_offset >= current_chunk_end_offset && current_chunk_index < chunks.len() {
             // Mark this chunk as cached
-            chunks[current_chunk_index]
-                .1
-                .cached
-                .store(true, Ordering::SeqCst);
+            chunks[current_chunk_index].1.cached.store(true, Ordering::SeqCst);
 
             entry
                 .flush_cache_meta()
                 .map_err(|e| {
-                    tracing::error!(
-                        "Failed to flush metadata: {}, this will cause cache issues",
-                        e
-                    );
+                    tracing::error!("Failed to flush metadata: {}, this will cause cache issues", e);
                 })
                 .ok();
 
@@ -276,8 +265,7 @@ async fn download_contiguous_chunks_inner(
             // Move to the next chunk
             current_chunk_index += 1;
             if current_chunk_index < chunks.len() {
-                current_chunk_end_offset =
-                    chunks[current_chunk_index].1.offset + chunks[current_chunk_index].1.size;
+                current_chunk_end_offset = chunks[current_chunk_index].1.offset + chunks[current_chunk_index].1.size;
             }
         }
     }

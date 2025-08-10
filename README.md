@@ -1,23 +1,13 @@
 # lumin
 
 > [!WARNING]
-> lumin is not stable and will break in weird ways. if you use it, understand that the cache and in worse scenarios the database itself may have to be reset.
- 
-lumin is a debrid proxy that handles streaming files from debrid services like TorBox using FUSE and provides a qBittorrent-compatible API to interact with them.
+> lumin is very unstable, assume you will discover bugs and will have to reset your database at some point.
 
-## features
+lumin is a middleman for debrid services that mounts them as a local filesystem and provides a qBittorrent-compatible API to interact with them, like [rdt-client](https://github.com/rogerfar/rdt-client) but streaming files on demand instead of downloading them ahead of time. Sonarr and Radarr are supported using hardlinks within the fuse mount.
 
-- Aggressive caching
-- Creating folders and hardlinks on the mount
-- Intelligent prefetching based on bitrate
-- qBittorrent-compatible API
-- (Very early) Web UI to manage torrents
-- Some other stuff I'm probably forgetting
-- It works with sonarr at least
+currently only [TorBox](https://torbox.app/subscription?referral=f6ae20d2-ccaa-43a8-9006-e0aac8cc8d71) is supported.
 
 ## usage
-
-this section is rough while i figure things out
 
 ```yml
 services:
@@ -25,11 +15,6 @@ services:
     container_name: lumin
     image: docker.io/sylver/lumin
     restart: unless-stopped
-    healthcheck:
-      test: curl --connect-timeout 10 --silent --show-error --fail http://localhost:8000/trpc/get_torrents
-      timeout: 60s
-      interval: 30s
-      retries: 4
     cap_add:
       - SYS_ADMIN
     devices:
@@ -37,18 +22,17 @@ services:
     security_opt:
       - apparmor:unconfined
     ports:
-      - 127.0.0.1:8000:8000 # webui + qbittorrent-compatible api
+      - 127.0.0.1:8000:8000 # qbittorrent api
     volumes:
       - /mnt:/mnt:rshared
-      - ./.lumin:/data # this includes the cache path and database
+      - ./.lumin:/data # this stores the cache data and database information
     environment:
-      - RUST_LOG=lumin=debug
+      - LUMIN_MOUNT_PATH=/mnt/lumin
       - LUMIN_ALLOW_OTHER=true # whether other users can access the mount
       - LUMIN_MOUNT_UNPRIVILEGED=true
-      - LUMIN_MOUNT_PATH=/mnt/lumin
       - LUMIN_TORBOX_KEY=${TORBOX_KEY}
-      # these are optional, required for webdav.
-      # without these, the api is used which may increase ttfb.
+      # these are optional and will enable webdav.
+      # recommended for slightly better performance.
       - LUMIN_TORBOX_USERNAME=${TORBOX_USERNAME}
       - LUMIN_TORBOX_PASSWORD=${TORBOX_PASSWORD}
 ```
@@ -62,12 +46,6 @@ services:
 5. Change the "Category" to "sonarr" or "radarr" exactly
    1. If you get an error similar to "Failed to authenticate with qBittorrent" its likely because the category does not match the labels configured in lumin. If sonarr can't create the label it fails with an auth error.
 6. Click "Test" then "Save"
-
-### notes
-
-- running fuse under docker can be tricky, `/mnt:/mnt:rshared` seems to avoid most of the downfalls but prepare yourself for that.
-- the cache uses sparse files which will usually show as the full file size, even if the physical size is much smaller.
-- specifying `LUMIN_TORBOX_PASSWORD` and `LUMIN_TORBOX_USERNAME` can slightly increase performance if you have high ping to torbox, but webdav can cause issues and is less reliable than the CDN directly. 
 
 ## todo
 
@@ -85,3 +63,9 @@ services:
 - "On Demand" torrents that are added to debrid on read
   - This would be incompatible with plex, probably sonarr/radarr, and probably jellyfin as they read files on scan.
   - Usenet may be fast enough to not need them to be cached ahead of time
+- "Passthrough" mounting, similar to mergerfs
+  - Attach a source drive like `/mnt/pool`, files in it will show up in lumins mount
+  - When remote files are streamed, we store the cache data in the source drive at eg `/mnt/pool/media/.../some_file.mkv.lpartial`
+  - If the entire file is streamed (or configuration is set to download the full file), we move the file to `/mnt/pool/media/.../some_file.mkv` and detach it from lumin
+  - This means you can start and stop using lumin easily without "losing" data, you could even "eject" by downloading everything lumin has and then removing it.
+  - This would be cool for hybrid setups

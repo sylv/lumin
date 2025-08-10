@@ -13,7 +13,7 @@ pub struct Config {
     pub torbox_key: String,
     pub torbox_username: Option<String>,
     pub torbox_password: Option<String>,
-    pub delete_unused: bool,
+    pub delete_unmapped: bool,
     pub categories: Vec<String>,
     pub max_torrent_size: Option<u64>,
     pub cache_target_size: u64,
@@ -40,7 +40,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
         .set_default("ensure_unmounted", true)?
         .set_default("cache_target_size", cache_target_size)?
         .set_default("cache_max_size", cache_max_size)?
-        .set_default("delete_unused", false)?
+        .set_default("delete_unmapped", false)?
         .set_default("categories", vec!["sonarr", "radarr"])?
         .set_default("chunk_preload", vec![chunk_preload.0, chunk_preload.1])?
         .set_default("cache_grace_period_secs", 300)? // 5 minutes
@@ -72,10 +72,7 @@ fn load_config() -> Result<Config, Box<dyn std::error::Error>> {
 
     if config.categories.len() == 1 {
         let first = config.categories.into_iter().next().unwrap();
-        config.categories = first
-            .split(",")
-            .map(|s| s.to_string())
-            .collect::<Vec<String>>();
+        config.categories = first.split(",").map(|s| s.to_string()).collect::<Vec<String>>();
     }
 
     Ok(config)
